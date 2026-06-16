@@ -162,6 +162,24 @@ def main(
             click.echo(f"  Run ID: {summary.get('run_id')}")
             click.echo(f"  Patch summary: {summary.get('patch_summary', {})}")
             click.echo(f"  Writer: {summary.get('writer', {})}")
+
+        # --- Admin status update (chained after successful pipeline run) ---
+        try:
+            from scripts.estado_administrativo.actualizar_estado import run_update as update_admin_status
+
+            click.echo("\n" + "=" * 70)
+            click.echo("[ADMIN STATUS] Running estado administrativo update...")
+            admin_summary = update_admin_status(
+                config=config,
+                live=not dry_run,
+                commission=commission,
+            )
+            click.echo(
+                f"[ADMIN STATUS] Done — Changes: {admin_summary.get('changes', 0)} | "
+                f"Unchanged: {admin_summary.get('unchanged', 0)}"
+            )
+        except Exception as admin_err:  # noqa: BLE001
+            click.echo(f"[ADMIN STATUS] Failed (non-fatal): {admin_err}", err=True)
     except Exception as error:  # noqa: BLE001
         click.echo(f"[ERROR] Pipeline failed: {error}", err=True)
         raise SystemExit(1) from error

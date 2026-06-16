@@ -132,14 +132,32 @@ def transition_sort_key(item: tuple[tuple[str, str], int]) -> tuple[int, str, st
     )
 
 
-@click.command()
-@click.option("--live", is_flag=True, default=False, help="Write changes to DB (default: dry-run)")
-@click.option("--commission", default=None, help="Filter by commission name (substring match)")
-@click.option("--curso", default=None, type=int, multiple=True, help="Filter by curso ID (can pass multiple, e.g. --curso 60 or --curso 59 --curso 60)")
-@click.option("--config", "config_path", default="config/settings.yaml")
-def main(live: bool, commission: str | None, curso: tuple[int, ...], config_path: str) -> None:
-    """Update estado administrativo based on cuotas paid in COBROS sheet."""
-    config = load_config(config_path)
+def run_update(
+    config: dict,
+    live: bool = False,
+    commission: str | None = None,
+    cursos: tuple[int, ...] | None = None,
+) -> dict:
+    """Run the estado administrativo update.
+
+    Parameters
+    ----------
+    config:
+        Already-loaded settings dict (from ``load_config``).
+    live:
+        If *True* write changes to DB; otherwise dry-run.
+    commission:
+        Optional substring filter for commission name.
+    cursos:
+        Course IDs to target.  Defaults to ``TARGET_COURSES`` when *None* or
+        empty.
+
+    Returns
+    -------
+    dict
+        Summary with keys: ``changes``, ``unchanged``, ``skipped``,
+        ``errors``, ``pending_benefit``.
+    """
     today = date.today()
     mode = "LIVE" if live else "DRY-RUN"
     click.echo(f"[{mode}] Estado Administrativo Update | Date: {today}")
@@ -154,7 +172,7 @@ def main(live: bool, commission: str | None, curso: tuple[int, ...], config_path
     sql.connect()
 
     # Get target commissions
-    target_cursos = curso if curso else TARGET_COURSES
+    target_cursos = cursos if cursos else TARGET_COURSES
     cursor = sql.connection.cursor()
     placeholders = ",".join("?" for _ in target_cursos)
     cursor.execute(f"""
@@ -371,6 +389,7 @@ def main(live: bool, commission: str | None, curso: tuple[int, ...], config_path
                     f"{row['old_label']} -> {row['new_label']}{pending_flag}"
                 )
 
+    total_errors = 0
     if live and results:
         click.echo(f"\n[LIVE] Applying {len(results)} updates to COMISIONES_PERSONAS...")
         applied = 0
@@ -388,11 +407,31 @@ def main(live: bool, commission: str | None, curso: tuple[int, ...], config_path
                 errors += 1
 
         sql.connection.commit()
+        total_errors = errors
         click.echo(f"  Applied: {applied} | Errors: {errors}")
     elif not live and results:
         click.echo(f"\n[DRY-RUN] No changes applied. Use --live to apply.")
 
     sql.connection.close()
+
+    return {
+        "changes": total_changes,
+        "unchanged": total_unchanged,
+        "skipped": total_skipped,
+        "errors": total_errors,
+        "pending_benefit": total_pending_benefit,
+    }
+
+
+@click.command()
+@click.option("--live", is_flag=True, default=False, help="Write changes to DB (default: dry-run)")
+@click.option("--commission", default=None, help="Filter by commission name (substring match)")
+@click.option("--curso", default=None, type=int, multiple=True, help="Filter by curso ID (can pass multiple, e.g. --curso 60 or --curso 59 --curso 60)")
+@click.option("--config", "config_path", default="config/settings.yaml")
+def main(live: bool, commission: str | None, curso: tuple[int, ...], config_path: str) -> None:
+    """Update estado administrativo based on cuotas paid in COBROS sheet."""
+    config = load_config(config_path)
+    run_update(config=config, live=live, commission=commission, cursos=curso)
 
 
 if __name__ == "__main__":
