@@ -1,0 +1,121 @@
+[
+  {
+    "scenario": "DB concept says inscription but amount matches cuota price",
+    "input": {
+      "payment_amount": "98640.00",
+      "db_concept": "Inscripción",
+      "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
+      "ledger": {"inscription_paid": true, "cuotas_paid": 1},
+      "candidates": [
+        {"concept": "Inscripción", "amount": "54800.00", "score": 0.60},
+        {"concept": "Cuota 2", "amount": "98640.00", "score": 0.85}
+      ]
+    },
+    "output": {
+      "action": "fix",
+      "chosen_candidate_index": 1,
+      "suggested_concept": "Cuota 2",
+      "suggested_amount": "98640.00",
+      "confidence": 0.92,
+      "reasoning": "Amount exactly matches cuota price. Inscription already paid. DB concept is wrong — student selected the wrong option. This is Cuota 2."
+    }
+  },
+  {
+    "scenario": "Amount doesn't match any known price",
+    "input": {
+      "payment_amount": "150000.00",
+      "db_concept": "Cuota",
+      "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
+      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "candidates": [
+        {"concept": "Inscripción", "amount": "54800.00", "score": 0.40},
+        {"concept": "Cuota 1", "amount": "98640.00", "score": 0.35},
+        {"concept": "Desconocido", "amount": "150000.00", "score": 0.30}
+      ]
+    },
+    "output": {
+      "action": "flag_review",
+      "chosen_candidate_index": null,
+      "suggested_concept": null,
+      "suggested_amount": null,
+      "confidence": 0.35,
+      "reasoning": "Amount 150000 doesn't match inscription (54800), cuota (98640), or any combination. Could be a special arrangement. Needs human review."
+    }
+  },
+  {
+    "scenario": "Combined payment: inscription + cuota",
+    "input": {
+      "payment_amount": "153440.00",
+      "db_concept": "Inscripción",
+      "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
+      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "candidates": [
+        {"concept": "Inscripción", "amount": "54800.00", "score": 0.55},
+        {"concept": "Cuota 1", "amount": "98640.00", "score": 0.40}
+      ]
+    },
+    "output": {
+      "action": "fix",
+      "chosen_candidate_index": null,
+      "suggested_concept": "Inscripción + Cuota 1",
+      "suggested_amount": "153440.00",
+      "confidence": 0.95,
+      "reasoning": "Amount 153440 = inscription 54800 + cuota 98640. This is a combined payment. The deterministic allocator should have caught this — amounts match exactly."
+    }
+  },
+  {
+    "scenario": "Beca 50% — payment equals inscription + discounted cuota",
+    "input": {
+      "payment_amount": "104120.00",
+      "db_concept": "Inscripción",
+      "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
+      "student_info": {
+        "persona_observaciones": "",
+        "comision_observaciones": "beca 50%"
+      },
+      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "candidates": [
+        {"concept": "Cuota 1", "amount": "98640.00", "score": 0.72},
+        {"concept": "Cuota 1", "amount": "104120.00", "score": 0.76},
+        {"concept": "Inscripción", "amount": "104120.00", "score": 0.60}
+      ]
+    },
+    "output": {
+      "action": "fix",
+      "chosen_candidate_index": null,
+      "suggested_concept": "Inscripción + Cuota 1",
+      "suggested_amount": "104120.00",
+      "confidence": 0.93,
+      "reasoning": "Observations say 'beca 50%'. Discounted cuota = 98640 * 0.50 = 49320. Inscription 54800 + discounted cuota 49320 = 104120, which matches the payment exactly. This is a combined payment of inscription + first cuota with 50% scholarship applied to the cuota."
+    }
+  },
+  {
+    "scenario": "Payment matches another commission's inscription price",
+    "input": {
+      "payment_amount": "52050.00",
+      "db_concept": "Inscripción",
+      "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
+      "student_info": {
+        "persona_observaciones": "",
+        "comision_observaciones": ""
+      },
+      "active_commissions": [
+        {"nombre": "PERITO-S-TOTORAL-2026", "inscripcion": "54800.00", "cuota": "98640.00"},
+        {"nombre": "PERITO-D-FEBRERO-2026", "inscripcion": "52050.00", "cuota": "93690.00"}
+      ],
+      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "candidates": [
+        {"concept": "Inscripción", "amount": "54800.00", "score": 0.74},
+        {"concept": "Inscripción", "amount": "52050.00", "score": 0.60}
+      ]
+    },
+    "output": {
+      "action": "flag_review",
+      "chosen_candidate_index": null,
+      "suggested_concept": null,
+      "suggested_amount": null,
+      "confidence": 0.65,
+      "reasoning": "The payment amount 52050 matches exactly the inscription price of another active commission (PERITO-D-FEBRERO-2026: inscripcion=52050). This payment likely belongs to the other commission, not this one. Needs human review to confirm."
+    }
+  }
+]

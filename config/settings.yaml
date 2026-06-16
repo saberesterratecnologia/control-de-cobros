@@ -1,0 +1,43 @@
+# ============================================================
+# Configuración del agente de conciliación
+# ============================================================
+# Los secretos (server, database, passwords, API keys) se
+# configuran en .env — NO acá. Este archivo es committeable.
+# ============================================================
+
+database:
+  # Valores por defecto — sobreescritos por .env si están definidos
+  driver: "ODBC Driver 17 for SQL Server"
+  server: ""       # ← viene de DB_SERVER en .env
+  database: ""     # ← viene de DB_DATABASE en .env
+  trusted_connection: true  # se desactiva automáticamente si DB_USERNAME está en .env
+
+sheets:
+  credentials_file: "credentials.json"  # ← viene de GOOGLE_CREDENTIALS_PATH en .env
+  spreadsheet_id: ""                     # ← viene de SPREADSHEET_ID en .env (preferido)
+  spreadsheet_name: "Cobros 2026 - Saberes-Terra"  # fallback si no hay ID
+  worksheet_name: "COBROS"
+
+llm:
+  primary_model: "gpt-4o-mini"
+  fallback_model: "gpt-4o"
+  confidence_threshold_auto: 0.90
+  confidence_threshold_flagged: 0.75
+  max_retries: 2
+  temperature: 0.1
+
+agent:
+  dry_run: true
+  id_organizacion: 2
+  year: 2026
+  batch_size: 50
+  checkpoint_interval: 50
+  max_pending_review: 100
+
+sqlite:
+  db_path: "data/context.db"
+
+logging:
+  level: "INFO"
+  format: "json"
+  file: "data/agent.log"

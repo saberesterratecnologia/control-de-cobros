@@ -1,0 +1,44 @@
+# Python caches and artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+credentials.json
+microservicios-*.json
+
+# Local runtime data
+data/*.db
+data/*.log
+data/*.json
+data/*.txt
+data/*.py
+
+# Local assets (screenshots, exports)
+*.xlsx
+*.png
+
+# AI tooling
+.atl/
+
+# IDE
+.idea/
+.vscode/
