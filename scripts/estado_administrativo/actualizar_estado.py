@@ -192,9 +192,9 @@ def run_update(
 
     click.echo(f"  Commissions: {len(commissions)}")
 
-    # Build a lookup: (comision_name_stripped, dni_stripped) -> list of cuota numbers
+    # Build a lookup: (comision_name_stripped, dni_stripped) -> set of unique cuota numbers
     # from Venta rows in the sheet
-    sheet_cuotas: dict[tuple[str, str], list[int]] = {}
+    sheet_cuotas: dict[tuple[str, str], set[int]] = {}
     for row in all_rows:
         if not row.comision or not row.dni:
             continue
@@ -203,7 +203,7 @@ def run_update(
         cuota_n = extract_max_cuota(row.concepto or "")
         if cuota_n is not None:
             key = (row.comision.strip(), row.dni.strip())
-            sheet_cuotas.setdefault(key, []).append(cuota_n)
+            sheet_cuotas.setdefault(key, set()).add(cuota_n)
 
     # Process each commission
     total_changes = 0
@@ -268,10 +268,10 @@ def run_update(
 
             # Look up cuotas paid in sheet
             key = (nombre, dni_clean)
-            cuotas_in_sheet = sheet_cuotas.get(key, [])
-            max_cuota_paid = max(cuotas_in_sheet) if cuotas_in_sheet else 0
+            cuotas_in_sheet = sheet_cuotas.get(key, set())
+            cuotas_paid_count = len(cuotas_in_sheet)
 
-            new_state = determine_new_state(max_cuota_paid, expected, total_cuotas)
+            new_state = determine_new_state(cuotas_paid_count, expected, total_cuotas)
 
             # Check if the MOST RECENT payment report is still pending
             # conciliation (no bank movement matched yet).  Only the last
@@ -321,9 +321,9 @@ def run_update(
                 "commission": nombre,
                 "dni": dni_clean,
                 "name": f"{apellidos}, {nombres}",
-                "cuotas_paid": max_cuota_paid,
+                "cuotas_paid": cuotas_paid_count,
                 "expected": expected,
-                "deficit": max(0, expected - max_cuota_paid),
+                "deficit": max(0, expected - cuotas_paid_count),
                 "total_cuotas": total_cuotas,
                 "old_state": current_state,
                 "old_label": old_label,
