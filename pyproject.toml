@@ -9,22 +9,22 @@ description = "Payment reconciliation agent between SQL Server and Google Sheets
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "pydantic>=2.0",
-  "pyodbc",
-  "gspread",
-  "google-auth",
-  "openai",
-  "pyyaml",
-  "click",
-  "python-dotenv",
+  "pydantic==2.13.4",
+  "pyodbc==5.3.0",
+  "gspread==6.2.1",
+  "google-auth==2.52.0",
+  "openai==2.36.0",
+  "pyyaml==6.0.3",
+  "click==8.3.3",
+  "python-dotenv==1.2.2",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest",
-  "pytest-cov",
-  "ruff",
-  "mypy",
+  "pytest==9.0.3",
+  "pytest-cov==7.1.0",
+  "ruff==0.15.12",
+  "mypy==2.1.0",
 ]
 
 [tool.ruff]
