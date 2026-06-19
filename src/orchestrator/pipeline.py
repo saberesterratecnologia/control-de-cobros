@@ -566,8 +566,13 @@ class ConciliationPipeline:
         # After all ambiguous payments are resolved, renumber cuotas
         # chronologically and recompute next_venta with the correct
         # ledger state and a business-derived reference date.
+        # When a cutoff was applied, seed the renumbering ledger from the
+        # sheet so cuota ordinals continue from the pre-existing state
+        # instead of restarting at 1.
+        from src.rules.allocation_engine import Ledger
+        sheet_ledger = Ledger.from_sheet_rows(actual_rows) if use_sheet_ledger else None
         resolved_allocations, next_venta = allocator.renumber_allocations(
-            resolved_allocations, student,
+            resolved_allocations, student, initial_ledger=sheet_ledger,
         )
 
         discrepancies = self.reconciler.reconcile(

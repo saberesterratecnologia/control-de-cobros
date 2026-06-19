@@ -951,12 +951,18 @@ class AllocationEngine:
         self,
         allocations: list[Allocation],
         student: Student,
+        initial_ledger: Ledger | None = None,
     ) -> tuple[list[Allocation], ExpectedRow | None]:
         """Rebuild cuota ordinals and next_venta from final accepted allocations.
 
         Called by the pipeline AFTER all ambiguous payments have been resolved
         (via LLM or manual review).  This is the "Pass 2" that produces
         canonical, chronologically-correct cuota numbering.
+
+        When *initial_ledger* is provided (e.g. built from pre-cutoff sheet
+        rows), cuota numbering continues from the ledger state instead of
+        starting at 1.  This prevents re-numbering Cuota 4 as Cuota 1 when
+        earlier cuotas were skipped via cutoff.
 
         Returns (renumbered_allocations, new_next_venta).
         """
@@ -968,7 +974,13 @@ class AllocationEngine:
             ),
         )
 
-        ledger = Ledger()
+        ledger = Ledger(
+            inscription_paid=initial_ledger.inscription_paid,
+            cuotas_paid=initial_ledger.cuotas_paid,
+            pago_unico=initial_ledger.pago_unico,
+            fully_paid=initial_ledger.fully_paid,
+            existing_concepts=set(initial_ledger.existing_concepts),
+        ) if initial_ledger is not None else Ledger()
         renumbered: list[Allocation] = []
 
         for alloc in sorted_allocs:

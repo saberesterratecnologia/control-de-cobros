@@ -470,3 +470,92 @@ def test_recargo_like_amount_boosts_cuota_candidate() -> None:
     assert len(cuota_allocs) == 1
     assert cuota_allocs[0].concept == "Cuota 1"
     assert cuota_allocs[0].amount == Decimal("109600.00")
+
+
+# ---------------------------------------------------------------------------
+# renumber_allocations with initial_ledger
+# ---------------------------------------------------------------------------
+
+
+def test_renumber_with_initial_ledger_continues_numbering() -> None:
+    """Regression: when cutoff skips cuotas 1-3, the 4th cuota payment
+    must be numbered Cuota 4, not Cuota 1.
+
+    This is the exact scenario of DNI 46603843: 3 cuotas already in the
+    sheet, a new payment arrives and renumber_allocations was resetting
+    the ledger to zero, producing 'Cuota 1' instead of 'Cuota 4'.
+    """
+    engine = AllocationEngine(_commission(total=9))
+
+    # Simulate the new payment that arrives post-cutoff
+    cuota4 = _cp(amount="98640.00", concept_id=2, id_pago=87202)
+    cuota4.payment.fecha = datetime(2026, 6, 10, 12, 0, 0)
+
+    from src.models.pipeline import Allocation
+    allocations = [
+        Allocation(payment=cuota4, concept="Cuota 4", amount=Decimal("98640.00"),
+                   generates_venta=True, generates_cobro=True),
+    ]
+
+    # Ledger from sheet: inscription + 3 cuotas already paid
+    pre_ledger = Ledger(
+        inscription_paid=True,
+        cuotas_paid=3,
+        existing_concepts={"Inscripción", "Cuota 1", "Cuota 2", "Cuota 3"},
+    )
+
+    renumbered, next_venta = engine.renumber_allocations(
+        allocations, _student(), initial_ledger=pre_ledger,
+    )
+
+    assert len(renumbered) == 1
+    assert renumbered[0].concept == "Cuota 4"
+    assert next_venta is not None
+    assert next_venta.concepto == "Cuota 5"
+
+
+def test_renumber_without_initial_ledger_starts_from_one() -> None:
+    """Without initial_ledger (no cutoff), renumbering starts from Cuota 1."""
+    engine = AllocationEngine(_commission())
+
+    cuota = _cp(amount="98640.00", concept_id=2, id_pago=1)
+    cuota.payment.fecha = datetime(2026, 3, 10, 12, 0, 0)
+
+    from src.models.pipeline import Allocation
+    allocations = [
+        Allocation(payment=cuota, concept="Cuota 5", amount=Decimal("98640.00"),
+                   generates_venta=True, generates_cobro=True),
+    ]
+
+    renumbered, _ = engine.renumber_allocations(allocations, _student())
+
+    assert renumbered[0].concept == "Cuota 1"
+
+
+def test_renumber_with_initial_ledger_multiple_new_cuotas() -> None:
+    """When initial_ledger has 2 cuotas and 3 new arrive, they get 3, 4, 5."""
+    engine = AllocationEngine(_commission(total=8))
+
+    from src.models.pipeline import Allocation
+    allocs = []
+    for i, (pago_id, month) in enumerate([(100, 3), (101, 4), (102, 5)]):
+        cp = _cp(amount="98640.00", concept_id=2, id_pago=pago_id)
+        cp.payment.fecha = datetime(2026, month, 10, 12, 0, 0)
+        allocs.append(
+            Allocation(payment=cp, concept=f"Cuota {i+1}", amount=Decimal("98640.00"),
+                       generates_venta=True, generates_cobro=True)
+        )
+
+    pre_ledger = Ledger(
+        inscription_paid=True,
+        cuotas_paid=2,
+        existing_concepts={"Inscripción", "Cuota 1", "Cuota 2"},
+    )
+
+    renumbered, next_venta = engine.renumber_allocations(
+        allocs, _student(), initial_ledger=pre_ledger,
+    )
+
+    assert [a.concept for a in renumbered] == ["Cuota 3", "Cuota 4", "Cuota 5"]
+    assert next_venta is not None
+    assert next_venta.concepto == "Cuota 6"
