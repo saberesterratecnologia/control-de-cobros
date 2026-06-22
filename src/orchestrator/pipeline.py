@@ -849,8 +849,6 @@ class ConciliationPipeline:
         reasons: list[str] = []
         cuota_numbers: list[int] = []
         has_inscription = False
-        insc_price = commission.valor_inscripcion_promocion or commission.valor_inscripcion
-        cuota_price = commission.valor_cuota_bonificada or commission.valor_cuota
         total_cuotas = commission.cantidad_cuotas or 0
         is_short_single = self._commission_has_short_course_single_payment(commission)
 
@@ -860,8 +858,6 @@ class ConciliationPipeline:
             concepto_lower = concepto.casefold()
             if "inscripción" in concepto_lower or "inscripcion" in concepto_lower:
                 has_inscription = True
-                if insc_price is not None and not self._is_close_amount(row.monto, Decimal(insc_price)):
-                    reasons.append("inscription_with_non_standard_amount")
                 continue
 
             cuota_n = self._extract_cuota_number(concepto)
@@ -870,17 +866,6 @@ class ConciliationPipeline:
 
             cuota_numbers.append(cuota_n)
             cuota_counts[cuota_n] = cuota_counts.get(cuota_n, 0) + 1
-
-            if cuota_n == 1 and insc_price is not None and self._is_close_amount(row.monto, Decimal(insc_price)):
-                reasons.append("cuota_1_matches_inscription_amount")
-
-            if (
-                cuota_n == 1
-                and insc_price is not None
-                and cuota_price is not None
-                and self._is_close_amount(row.monto, Decimal(insc_price) + Decimal(cuota_price))
-            ):
-                reasons.append("cuota_1_combines_inscription_and_cuota")
 
         if cuota_numbers and not has_inscription and not is_short_single:
             reasons.append("missing_inscription_with_existing_cuotas")

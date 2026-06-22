@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from src.models.pipeline import Discrepancy, DiscrepancyType, Resolution, Severity
-from src.models.sheet import ExpectedRow
+from src.models.sheet import ExpectedRow, SheetRow
 from src.models.source import BankMovement, Payment
 from src.orchestrator.pipeline import ConciliationPipeline
 
@@ -249,3 +249,101 @@ def test_inline_conciliation_updates_payment_in_dry_run(sample_config):
 
     assert pipeline._counters.payments_conciliated == 1
     assert updated[0].id_movimiento_bancario == movement.id_movimiento
+
+
+# ===================================================================
+# _detect_invalid_sheet_sequence — relaxed guard tests
+# ===================================================================
+
+
+def _make_venta_row(concepto: str, monto: Decimal, **overrides) -> SheetRow:
+    """Build a minimal Venta SheetRow for guard tests."""
+    defaults = dict(
+        row_number=1,
+        organizacion="Org",
+        curso="Curso",
+        comision="Com A",
+        fecha_movimiento=date(2026, 3, 1),
+        tipo_movimiento="Venta",
+        dni="30111222",
+        concepto=concepto,
+        monto=monto,
+        medio_pago="Mercado Pago",
+        estudiante="Pérez Juan",
+        estado_administrativo=None,
+        estado_deuda=None,
+        id_movimiento_bancario=None,
+        id_pago_mp=None,
+    )
+    defaults.update(overrides)
+    return SheetRow(**defaults)
+
+
+class TestDetectInvalidSheetSequenceRelaxed:
+    """Verify that relaxed guard no longer triggers on removed reasons."""
+
+    def test_non_standard_inscription_amount_not_flagged(self, sample_config, sample_commission):
+        """Inscription with a different amount should NOT trigger the guard."""
+        pipeline = ConciliationPipeline(sample_config)
+        # sample_commission has valor_inscripcion_promocion=10000
+        # Use a very different amount — previously this triggered inscription_with_non_standard_amount
+        rows = [_make_venta_row("Inscripción", Decimal("7500"))]
+        reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
+        assert "inscription_with_non_standard_amount" not in reasons
+
+    def test_cuota_1_matching_inscription_amount_not_flagged(self, sample_config, sample_commission):
+        """Cuota 1 with monto equal to inscription price should NOT trigger the guard."""
+        pipeline = ConciliationPipeline(sample_config)
+        insc_price = sample_commission.valor_inscripcion_promocion  # 10000
+        rows = [
+            _make_venta_row("Inscripción", insc_price),
+            _make_venta_row("Cuota 1", insc_price, row_number=2),
+        ]
+        reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
+        assert "cuota_1_matches_inscription_amount" not in reasons
+
+    def test_cuota_1_combining_inscription_and_cuota_not_flagged(self, sample_config, sample_commission):
+        """Cuota 1 with monto = inscription + cuota should NOT trigger the guard."""
+        pipeline = ConciliationPipeline(sample_config)
+        combined = sample_commission.valor_inscripcion_promocion + sample_commission.valor_cuota_bonificada
+        rows = [
+            _make_venta_row("Inscripción", sample_commission.valor_inscripcion_promocion),
+            _make_venta_row("Cuota 1", combined, row_number=2),
+        ]
+        reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
+        assert "cuota_1_combines_inscription_and_cuota" not in reasons
+
+    def test_kept_guards_still_fire(self, sample_config, sample_commission):
+        """Verify the retained guards still detect genuine issues."""
+        pipeline = ConciliationPipeline(sample_config)
+        # Missing inscription + duplicate cuota + cuota exceeds total
+        rows = [
+            _make_venta_row("Cuota 1", Decimal("5000")),
+            _make_venta_row("Cuota 1", Decimal("5000"), row_number=2),
+            _make_venta_row("Cuota 15", Decimal("5000"), row_number=3),
+        ]
+        reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
+        assert "missing_inscription_with_existing_cuotas" in reasons
+        assert "duplicate_cuota_1" in reasons
+        assert "cuota_exceeds_total:15>12" in reasons
+
+    def test_missing_cuotas_still_detected(self, sample_config, sample_commission):
+        """Missing cuotas in sequence should still be caught."""
+        pipeline = ConciliationPipeline(sample_config)
+        rows = [
+            _make_venta_row("Inscripción", Decimal("10000")),
+            _make_venta_row("Cuota 3", Decimal("5000"), row_number=2),
+        ]
+        reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
+        assert "missing_cuotas_before_3:1,2" in reasons
+
+    def test_clean_sequence_returns_no_reasons(self, sample_config, sample_commission):
+        """A valid inscription + sequential cuotas should produce no reasons."""
+        pipeline = ConciliationPipeline(sample_config)
+        rows = [
+            _make_venta_row("Inscripción", Decimal("10000")),
+            _make_venta_row("Cuota 1", Decimal("5000"), row_number=2),
+            _make_venta_row("Cuota 2", Decimal("5000"), row_number=3),
+        ]
+        reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
+        assert reasons == []
