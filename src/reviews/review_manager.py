@@ -16,10 +16,56 @@ LOGGER = logging.getLogger(__name__)
 class ReviewManager:
     HEADER = ["case_id", "comision", "dni", "problema", "detalle", "resolucion"]
 
+    # Priority order for guard:invalid_sequence reasons (higher index = more severe).
+    _GUARD_REASON_SEVERITY: dict[str, int] = {
+        "cuota_1_matches_inscription_amount": 1,
+        "cuota_1_combines_inscription_and_cuota": 2,
+        "inscription_with_non_standard_amount": 3,
+        "missing_inscription_with_existing_cuotas": 4,
+        "duplicate_cuota": 5,
+        "missing_cuotas_before": 6,
+        "cuota_exceeds_total": 7,
+    }
+
     def __init__(self, sheets_connector: Any, context_manager: Any, config: dict[str, Any]):
         self.sheets = sheets_connector
         self.context = context_manager
         self.config = config
+
+    @staticmethod
+    def _format_monto(value: Any) -> str:
+        """Format a monetary value for display.
+
+        Takes a string like "52050.0000" or a number and returns "$52.050"
+        (dot as thousands separator, no decimals if all zeros, 2 decimals otherwise).
+        Returns "s/dato" for None or unparseable values.
+        """
+        if value is None:
+            return "s/dato"
+        try:
+            text = str(value).replace("$", "").replace(" ", "").strip()
+            if not text:
+                return "s/dato"
+            num = Decimal(text)
+            # Check if the fractional part is zero
+            if num == num.to_integral_value():
+                integer_part = int(num)
+                # Format with dot as thousands separator
+                formatted = f"{abs(integer_part):,}".replace(",", ".")
+                if integer_part < 0:
+                    formatted = f"-{formatted}"
+                return f"${formatted}"
+            else:
+                # Keep 2 decimal places, comma as decimal separator
+                integer_part = int(num)
+                frac = abs(num - integer_part)
+                frac_str = f"{frac:.2f}"[1:]  # ".XX"
+                formatted_int = f"{abs(integer_part):,}".replace(",", ".")
+                if integer_part < 0:
+                    formatted_int = f"-{formatted_int}"
+                return f"${formatted_int}{frac_str.replace('.', ',')}"
+        except (InvalidOperation, ValueError, TypeError):
+            return "s/dato"
 
     def _get_revisiones_sheet(self) -> Any | None:
         if self.sheets._client is None:  # noqa: SLF001
@@ -137,11 +183,22 @@ class ReviewManager:
                 )
             if anomaly == "cobro_no_aplica":
                 concepto = context_json.get("concepto") or "?"
-                monto_str = f"${monto}" if monto else ""
+                monto_fmt = self._format_monto(monto) if monto else ""
+                comision_name = str(context_json.get("commission") or "").strip()
+                comision_part = f" en {comision_name}" if comision_name else ""
                 return (
                     "Anomalía de hoja",
-                    f"DNI {dni} — Cobro {concepto} {monto_str} "
+                    f"DNI {dni}{comision_part} — Cobro {concepto} {monto_fmt} "
                     f"tiene 'No aplica' como medio de pago (los Cobros deben tener medio real)",
+                )
+            if anomaly == "negative_monto":
+                row_number = context_json.get("row_number") or context_json.get("row") or "?"
+                monto_fmt = self._format_monto(monto) if monto else "negativo"
+                concepto = context_json.get("concepto") or "?"
+                return (
+                    "Anomalía de hoja",
+                    f"DNI {dni} — Fila {row_number}: {concepto} tiene monto {monto_fmt}"
+                    f" (el monto no debería ser negativo)",
                 )
             return (
                 "Anomalía de hoja",
@@ -163,14 +220,38 @@ class ReviewManager:
             candidates = context_json.get("candidates") or []
             raw_fecha = context_json.get("fecha") or "?"
             fecha = str(raw_fecha).split("T")[0] if raw_fecha else "?"
-            candidates_str = ", ".join(
-                f"{c.get('concept', '?')} (${c.get('amount', '?')})"
+            monto_fmt = self._format_monto(monto)
+
+            # Check if all candidates are "Desconocido" or empty
+            all_unknown = all(
+                (c.get("concept") or "").strip().casefold() == "desconocido"
                 for c in candidates
-            ) if candidates else "sin candidatos claros"
+            ) if candidates else True
+
+            # Build pricing suffix if commission_prices available
+            commission_prices = context_json.get("commission_prices") or {}
+            pricing_suffix = ""
+            if commission_prices.get("inscripcion") or commission_prices.get("cuota"):
+                insc_fmt = self._format_monto(commission_prices.get("inscripcion"))
+                cuota_fmt = self._format_monto(commission_prices.get("cuota"))
+                pricing_suffix = f" (Inscripción={insc_fmt}, Cuota={cuota_fmt})"
+
+            if all_unknown:
+                return (
+                    "Requiere definición de concepto",
+                    f"Pago {payment_id or '?'} del {fecha} por {monto_fmt} — "
+                    f"No se pudo determinar el concepto automáticamente. "
+                    f"Revisar manualmente qué concepto corresponde.{pricing_suffix}",
+                )
+
+            candidates_str = ", ".join(
+                f"{c.get('concept', '?')} ({self._format_monto(c.get('amount'))})"
+                for c in candidates
+            )
             return (
                 "Requiere definición de concepto",
-                f"Pago {payment_id or '?'} del {fecha} por ${monto or '?'} — "
-                f"candidatos: {candidates_str}",
+                f"Pago {payment_id or '?'} del {fecha} por {monto_fmt} — "
+                f"candidatos: {candidates_str}{pricing_suffix}",
             )
 
         # --- Missing date / wrong value in fecha ---
@@ -213,12 +294,153 @@ class ReviewManager:
                 f"DNI {dni} en {commission} — no tiene fila correspondiente en la planilla",
             )
 
+        # --- Guard: invalid sequence ---
+        if reason == "guard:invalid_sequence":
+            return self._build_guard_summary(dni, context_json)
+
         # --- Generic fallback ---
         dtype = context_json.get("type") or reason
         return (
             "Requiere revisión",
             f"DNI {dni} — {dtype}",
         )
+
+    def _build_guard_summary(self, dni: str, context_json: dict[str, Any]) -> tuple[str, str]:
+        """Build problema/detalle for guard:invalid_sequence reviews.
+
+        Maps each guard reason to a specific, operator-friendly category and
+        detail message with commission pricing context.
+        """
+        reasons: list[str] = context_json.get("reasons") or []
+        pricing_insc = self._format_monto(context_json.get("pricing_inscripcion"))
+        pricing_cuota = self._format_monto(context_json.get("pricing_cuota"))
+        cantidad_cuotas = context_json.get("cantidad_cuotas", "?")
+
+        if not reasons:
+            return ("Requiere revisión", f"DNI {dni} — guard:invalid_sequence (sin razones)")
+
+        # Classify each reason into (problema, detalle) pairs
+        classified: list[tuple[str, str, int]] = []
+        for r in reasons:
+            problema, detalle, severity = self._classify_guard_reason(
+                r, dni, pricing_insc, pricing_cuota, cantidad_cuotas
+            )
+            classified.append((problema, detalle, severity))
+
+        # Pick the most severe reason for the problema column
+        classified.sort(key=lambda x: x[2], reverse=True)
+        problema = classified[0][0]
+
+        # Combine all details
+        if len(classified) == 1:
+            detalle = classified[0][1]
+        else:
+            detalle = " | ".join(c[1] for c in classified)
+
+        return (problema, detalle)
+
+    def _classify_guard_reason(
+        self,
+        reason: str,
+        dni: str,
+        pricing_insc: str,
+        pricing_cuota: str,
+        cantidad_cuotas: Any,
+    ) -> tuple[str, str, int]:
+        """Classify a single guard reason into (problema, detalle, severity)."""
+        if reason == "missing_inscription_with_existing_cuotas":
+            return (
+                "Falta inscripción",
+                f"DNI {dni} — Tiene cuotas cargadas pero no aparece la inscripción"
+                f" (Inscripción={pricing_insc})",
+                self._GUARD_REASON_SEVERITY.get("missing_inscription_with_existing_cuotas", 0),
+            )
+
+        if reason.startswith("duplicate_cuota_"):
+            cuota_num = reason.replace("duplicate_cuota_", "")
+            return (
+                "Cuota duplicada",
+                f"DNI {dni} — Cuota {cuota_num} aparece más de una vez en la hoja",
+                self._GUARD_REASON_SEVERITY.get("duplicate_cuota", 0),
+            )
+
+        if reason.startswith("missing_cuotas_before_"):
+            # Format: missing_cuotas_before_5:1,2,3
+            tail = reason.replace("missing_cuotas_before_", "")
+            parts = tail.split(":", 1)
+            cuota_num = parts[0] if parts else "?"
+            missing_list = parts[1] if len(parts) > 1 else "?"
+            return (
+                "Cuotas faltantes",
+                f"DNI {dni} — Faltan cuotas {missing_list} antes de la {cuota_num}"
+                f" (Cuota={pricing_cuota})",
+                self._GUARD_REASON_SEVERITY.get("missing_cuotas_before", 0),
+            )
+
+        if reason == "cuota_1_matches_inscription_amount":
+            return (
+                "Cuota 1 con monto de inscripción",
+                f"DNI {dni} — La Cuota 1 tiene el monto de inscripción ({pricing_insc})"
+                f" en vez de cuota ({pricing_cuota})",
+                self._GUARD_REASON_SEVERITY.get("cuota_1_matches_inscription_amount", 0),
+            )
+
+        if reason == "cuota_1_combines_inscription_and_cuota":
+            combined = self._compute_combined_amount(
+                context_json_val=None,
+                pricing_insc_str=pricing_insc,
+                pricing_cuota_str=pricing_cuota,
+            )
+            return (
+                "Cuota 1 combina inscripción + cuota",
+                f"DNI {dni} — La Cuota 1 tiene {combined}"
+                f" que parece ser inscripción + cuota juntas",
+                self._GUARD_REASON_SEVERITY.get("cuota_1_combines_inscription_and_cuota", 0),
+            )
+
+        if reason == "inscription_with_non_standard_amount":
+            return (
+                "Inscripción con monto irregular",
+                f"DNI {dni} — La inscripción tiene un monto diferente al esperado"
+                f" ({pricing_insc})",
+                self._GUARD_REASON_SEVERITY.get("inscription_with_non_standard_amount", 0),
+            )
+
+        if reason.startswith("cuota_exceeds_total:"):
+            # Format: cuota_exceeds_total:12>9
+            tail = reason.replace("cuota_exceeds_total:", "")
+            parts = tail.split(">", 1)
+            cuota_num = parts[0] if parts else "?"
+            total = parts[1] if len(parts) > 1 else str(cantidad_cuotas)
+            return (
+                "Cuota excede el total",
+                f"DNI {dni} — Tiene Cuota {cuota_num} pero la comisión solo tiene {total} cuotas",
+                self._GUARD_REASON_SEVERITY.get("cuota_exceeds_total", 0),
+            )
+
+        # Unknown guard reason — generic with the reason text
+        return (
+            "Requiere revisión",
+            f"DNI {dni} — {reason}",
+            0,
+        )
+
+    @staticmethod
+    def _compute_combined_amount(
+        context_json_val: Any,
+        pricing_insc_str: str,
+        pricing_cuota_str: str,
+    ) -> str:
+        """Compute the sum of inscription + cuota for display, or return a placeholder."""
+        try:
+            insc_text = pricing_insc_str.replace("$", "").replace(".", "").replace(",", ".").strip()
+            cuota_text = pricing_cuota_str.replace("$", "").replace(".", "").replace(",", ".").strip()
+            if insc_text and cuota_text and insc_text != "s/dato" and cuota_text != "s/dato":
+                combined = Decimal(insc_text) + Decimal(cuota_text)
+                return ReviewManager._format_monto(combined)
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+        return f"{pricing_insc_str}+{pricing_cuota_str}"
 
     @staticmethod
     def _dedup_key(comision: str, dni: str, problema: str, detalle: str) -> str:
@@ -262,6 +484,14 @@ class ReviewManager:
             comision = str(context_json.get("commission") or "").strip()
             dni = str(context_json.get("dni") or "").strip()
 
+            # Skip reviews without both comision AND dni — unactionable for operators
+            if not comision and not dni:
+                LOGGER.warning(
+                    "skipping review %s: missing both comision and dni", case_id
+                )
+                skipped += 1
+                continue
+
             content_key = self._dedup_key(comision, dni, problema, detalle)
             if content_key in existing_content_keys:
                 skipped += 1
@@ -271,6 +501,9 @@ class ReviewManager:
             rows_to_append.append(
                 [case_id, comision, dni, problema, detalle, ""]
             )
+
+        # Sort by comision (column index 1) so reviews are grouped naturally
+        rows_to_append.sort(key=lambda row: row[1])
 
         if rows_to_append:
             worksheet.append_rows(rows_to_append, value_input_option="RAW")
