@@ -183,6 +183,7 @@ def run_update(
         AND YEAR(fecha_inicio) = 2026
         AND id_curso IN ({placeholders})
         AND id_estado_comision IN (2, 3, 4)
+        AND analisis_pagos = 1
         ORDER BY nombre
     """, tuple(target_cursos))
     commissions = cursor.fetchall()
