@@ -991,6 +991,23 @@ class ConciliationPipeline:
                 if not self._is_valid_allocation_concept(chosen.concept):
                     chosen = None
 
+            # --- LLM suggested a valid concept not in candidates ---
+            # When the allocator only generated "Desconocido" but the LLM
+            # identified a canonical concept (e.g. "Cuota 1", "Inscripción"),
+            # trust the LLM suggestion directly instead of discarding it.
+            if chosen is None and self._is_valid_allocation_concept(suggested):
+                monto = ambiguous.payment.payment.monto
+                llm_tolerance = Decimal("0.60")
+                if self._is_monto_plausible_for_concept(monto, suggested, commission, tolerance=llm_tolerance):
+                    self._counters.auto_fix += 1
+                    return [Allocation(
+                        payment=ambiguous.payment,
+                        concept=suggested,
+                        amount=monto,
+                        generates_venta=True,
+                        generates_cobro=ambiguous.payment.movement is not None,
+                    )]
+
             # Block allocations where the monto is wildly different from any
             # known commission price — prevents $274.000 being labelled as
             # "Inscripción" when inscription costs $54.800 or $109.600.
@@ -1513,16 +1530,20 @@ class ConciliationPipeline:
             if target > 0
         )
 
+    _VALID_CONCEPT_RE = re.compile(
+        r"^(Inscripción|Inscripcion|Inscripción Seminario|Inscripcion Seminario"
+        r"|Cuota\s+\d+"
+        r"|Pago Único|Pago Unico"
+        r"|Derecho Examen"
+        r"|Certificación|Certificacion)$",
+        re.IGNORECASE,
+    )
+
     @staticmethod
     def _is_valid_allocation_concept(concept: str | None) -> bool:
         if not concept:
             return False
-        normalized = concept.strip().casefold()
-        if normalized == "desconocido":
-            return False
-        if "+" in normalized:
-            return False
-        return True
+        return bool(Pipeline._VALID_CONCEPT_RE.match(concept.strip()))
 
     def _plan_review(self, discrepancy: Discrepancy, reason: str) -> None:
         if discrepancy.actual_row is None:
