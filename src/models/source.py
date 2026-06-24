@@ -84,6 +84,7 @@ class Commission(BaseModel):
     duracion_meses: int | None = None
     fecha_inicio: date | None
     borrado: bool
+    analisis_pagos: bool = True
 
 
 class Student(BaseModel):

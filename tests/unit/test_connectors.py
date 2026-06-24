@@ -95,6 +95,7 @@ def test_sqlserver_connector_queries_are_parameterized(mock_connect: MagicMock) 
             9,
             datetime(2026, 1, 1).date(),
             False,
+            True,
         )
     ]
 
@@ -113,6 +114,7 @@ def test_sqlserver_connector_queries_are_parameterized(mock_connect: MagicMock) 
 
     executed_query, executed_params = fake_cursor.execute.call_args[0]
     assert "id_curso = ?" in executed_query
+    assert "analisis_pagos = 1" in executed_query
     assert executed_params == (60,)
 
 

@@ -151,9 +151,11 @@ class SQLServerConnector:
                 c.cantidad_cuotas,
                 c.duracion_meses,
                 c.fecha_inicio,
-                c.borrado
+                c.borrado,
+                c.analisis_pagos
             FROM COMISIONES c
             WHERE c.id_curso = ? AND c.borrado = 0
+              AND c.analisis_pagos = 1
             ORDER BY c.nombre
         """
         cursor = self._cursor()
@@ -171,6 +173,7 @@ class SQLServerConnector:
             "duracion_meses",
             "fecha_inicio",
             "borrado",
+            "analisis_pagos",
         ]
         return [Commission.model_validate(self._row_to_dict(row, columns)) for row in rows]
 
@@ -189,11 +192,13 @@ class SQLServerConnector:
                 c.cantidad_cuotas,
                 c.duracion_meses,
                 c.fecha_inicio,
-                c.borrado
+                c.borrado,
+                c.analisis_pagos
             FROM COMISIONES c
             WHERE c.id_organizacion = ?
               AND YEAR(c.fecha_inicio) = ?
               AND c.borrado = 0
+              AND c.analisis_pagos = 1
             ORDER BY c.nombre
         """
         cursor = self._cursor()
@@ -211,6 +216,7 @@ class SQLServerConnector:
             "duracion_meses",
             "fecha_inicio",
             "borrado",
+            "analisis_pagos",
         ]
         return [Commission.model_validate(self._row_to_dict(row, columns)) for row in rows]
 
@@ -273,7 +279,8 @@ class SQLServerConnector:
                 c.cantidad_cuotas,
                 c.duracion_meses,
                 c.fecha_inicio,
-                c.borrado
+                c.borrado,
+                c.analisis_pagos
             FROM COMISIONES_PERSONAS cp
             INNER JOIN COMISIONES c ON c.id_comision = cp.id_comision
             WHERE cp.id_persona = ?
@@ -281,6 +288,7 @@ class SQLServerConnector:
               AND c.borrado = 0
               AND c.id_organizacion = ?
               AND YEAR(c.fecha_inicio) = ?
+              AND c.analisis_pagos = 1
             ORDER BY c.fecha_inicio, c.nombre
         """
         cursor = self._cursor()
@@ -298,6 +306,7 @@ class SQLServerConnector:
             "duracion_meses",
             "fecha_inicio",
             "borrado",
+            "analisis_pagos",
         ]
         return [Commission.model_validate(self._row_to_dict(row, columns)) for row in rows]
 
