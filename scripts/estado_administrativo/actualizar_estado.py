@@ -238,6 +238,7 @@ def run_update(
             INNER JOIN PERSONAS p ON p.id_persona = cp.id_persona
             WHERE cp.id_comision = ?
             AND cp.eliminado = 0
+            AND cp.analisis_pagos = 1
             AND p.borrada = 0
             AND cp.id_rol = 1
             AND cp.id_estado_academico IN (2, 4, 5, 6, 8)

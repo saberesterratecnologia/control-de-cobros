@@ -120,6 +120,7 @@ class Student(BaseModel):
     id_estado_academico: int | None
     id_estado_administrativo: int | None
     eliminado: bool
+    analisis_pagos: bool = True
     persona_observaciones: str | None = None
     comision_observaciones: str | None = None
     fecha_hora_inscripcion: datetime | None = None

@@ -232,6 +232,7 @@ class SQLServerConnector:
                 cp.id_estado_academico,
                 cp.id_estado_administrativo,
                 cp.eliminado,
+                cp.analisis_pagos,
                 p.observaciones,
                 cp.observaciones,
                 cp.fechaHora_inscripcion
@@ -239,6 +240,7 @@ class SQLServerConnector:
             INNER JOIN PERSONAS p ON p.id_persona = cp.id_persona
             WHERE cp.id_comision = ?
               AND cp.eliminado = 0
+              AND cp.analisis_pagos = 1
               AND p.borrada = 0
             ORDER BY p.apellidos, p.nombres
         """
@@ -254,6 +256,7 @@ class SQLServerConnector:
             "id_estado_academico",
             "id_estado_administrativo",
             "eliminado",
+            "analisis_pagos",
             "persona_observaciones",
             "comision_observaciones",
             "fecha_hora_inscripcion",
