@@ -294,6 +294,14 @@ class ContextManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_pending_review_by_id(self, pending_review_id: int) -> dict[str, Any] | None:
+        conn = self._require_connection()
+        row = conn.execute(
+            "SELECT * FROM pending_reviews WHERE id = ? LIMIT 1",
+            (pending_review_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def update_pending_review_resolution(
         self,
         pending_review_id: int,
@@ -343,6 +351,18 @@ class ContextManager:
                 resolved_at,
                 created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(case_id) DO UPDATE SET
+                run_id = excluded.run_id,
+                commission = excluded.commission,
+                dni = excluded.dni,
+                problem = excluded.problem,
+                resolution = excluded.resolution,
+                monto = excluded.monto,
+                concepto_tipo = excluded.concepto_tipo,
+                pricing_inscripcion = excluded.pricing_inscripcion,
+                pricing_cuota = excluded.pricing_cuota,
+                monto_ratio = excluded.monto_ratio,
+                resolved_at = excluded.resolved_at
             """,
             (
                 case_id,
@@ -362,6 +382,14 @@ class ContextManager:
         )
         conn.commit()
         return int(cursor.lastrowid)
+
+    def has_review_resolution(self, case_id: str) -> bool:
+        conn = self._require_connection()
+        row = conn.execute(
+            "SELECT 1 FROM review_resolutions WHERE case_id = ? LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        return row is not None
 
     def find_similar_resolutions(
         self,

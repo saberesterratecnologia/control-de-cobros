@@ -141,6 +141,7 @@ class AllocationEngine:
         existing_sheet_rows: list[SheetRow],
         student: Student,
         seed_ledger_from_sheet: bool = False,
+        ledger_seed_rows: list[SheetRow] | None = None,
     ) -> AllocationResult:
         """Main entry point.
 
@@ -154,10 +155,10 @@ class AllocationEngine:
         6. Return :class:`AllocationResult`.
 
         When *seed_ledger_from_sheet* is ``True``, the ledger is initialized
-        from the existing Venta rows in the sheet.  This is used when
-        already-closed payments (Venta+Cobro) have been filtered out upstream,
-        so the engine needs to know what cuotas are already covered without
-        seeing those payments.
+        from *ledger_seed_rows* (or from *existing_sheet_rows* when no seed rows
+        are provided). This is used when already-closed payments (Venta+Cobro)
+        have been filtered out upstream, so the engine needs to know what cuotas
+        are already covered without letting unresolved rows inflate the ledger.
         """
         cobro_rows = [
             row for row in existing_sheet_rows
@@ -169,7 +170,8 @@ class AllocationEngine:
             # already reflected.  This tells the engine which cuotas /
             # inscription are already covered so new payments get the
             # correct ordinal.
-            ledger = Ledger.from_sheet_rows(existing_sheet_rows)
+            ledger_rows = ledger_seed_rows if ledger_seed_rows is not None else existing_sheet_rows
+            ledger = Ledger.from_sheet_rows(ledger_rows)
         else:
             # Build ledger from scratch — the payments themselves (in
             # chronological order) are the source of truth for what

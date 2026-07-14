@@ -517,6 +517,24 @@ def _make_export_rm(open_reviews: list[dict]) -> tuple[ReviewManager, MagicMock]
     return rm, worksheet
 
 
+def _make_sync_rm(sheet_rows: list[list[str]]) -> tuple[ReviewManager, MagicMock, MagicMock]:
+    worksheet = MagicMock()
+    worksheet.row_values.return_value = ReviewManager.HEADER
+    worksheet.get_all_values.return_value = [ReviewManager.HEADER, *sheet_rows]
+
+    sheets = MagicMock()
+    sheets._client = MagicMock()
+    spreadsheet = MagicMock()
+    sheets._client.open_by_key.return_value = spreadsheet
+    spreadsheet.worksheet.return_value = worksheet
+
+    ctx_mgr = MagicMock()
+
+    config = {"sheets": {"spreadsheet_id": "fake-id"}}
+    rm = ReviewManager(sheets_connector=sheets, context_manager=ctx_mgr, config=config)
+    return rm, worksheet, ctx_mgr
+
+
 class TestExportDedupByPaymentId:
     """Verify export_to_sheet deduplicates ambiguous reviews by payment_id."""
 
@@ -619,3 +637,55 @@ class TestExportDedupByPaymentId:
         result = rm.export_to_sheet()
 
         assert result["exported"] == 2
+
+
+class TestSyncResolutionLifecycle:
+    def test_sync_resolves_open_review_and_deletes_row(self) -> None:
+        rm, ws, ctx = _make_sync_rm([["REV-10", "Com A", "30111222", "Problema", "Detalle", "Resolver asi"]])
+        ctx.get_pending_review_by_id.return_value = {
+            "id": 10,
+            "run_id": "run-1",
+            "reason": "ambiguous_allocation:auto",
+            "context_json": json.dumps({
+                "commission": "Com A",
+                "dni": "30111222",
+                "monto": "10000",
+                "commission_prices": {"cuota": "10000"},
+            }),
+            "status": "open",
+        }
+
+        result = rm.sync_resolutions()
+
+        assert result["synced"] == 1
+        assert result["removed_stale"] == 0
+        ctx.save_review_resolution.assert_called_once()
+        ctx.update_pending_review_resolution.assert_called_once_with(10, reviewer_notes="Resolver asi")
+        ws.delete_rows.assert_called_once_with(2)
+
+    def test_sync_removes_stale_row_for_closed_review(self) -> None:
+        rm, ws, ctx = _make_sync_rm([["REV-11", "Com A", "30111222", "Problema", "Detalle", "Resolver asi"]])
+        ctx.get_pending_review_by_id.return_value = {
+            "id": 11,
+            "status": "resolved",
+            "context_json": "{}",
+        }
+
+        result = rm.sync_resolutions()
+
+        assert result["synced"] == 0
+        assert result["removed_stale"] == 1
+        ctx.save_review_resolution.assert_not_called()
+        ctx.update_pending_review_resolution.assert_not_called()
+        ws.delete_rows.assert_called_once_with(2)
+
+    def test_sync_removes_already_synced_row_when_pending_missing(self) -> None:
+        rm, ws, ctx = _make_sync_rm([["REV-12", "Com A", "30111222", "Problema", "Detalle", "Resolver asi"]])
+        ctx.get_pending_review_by_id.return_value = None
+        ctx.has_review_resolution.return_value = True
+
+        result = rm.sync_resolutions()
+
+        assert result["synced"] == 0
+        assert result["removed_stale"] == 1
+        ws.delete_rows.assert_called_once_with(2)

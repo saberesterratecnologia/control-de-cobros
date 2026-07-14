@@ -184,11 +184,17 @@ class DecisionEngine:
             },
             "context": {
                 "payment_history": context.get("payment_history", []),
+                "payment_history_summary": context.get("payment_history_summary", {}),
                 "commission_prices": context.get("commission_prices", {}),
                 "student_info": context.get("student_info", {}),
+                "active_commissions": context.get("active_commissions", []),
                 "payment_record": context.get("payment_record"),
                 "bank_movement": context.get("bank_movement"),
                 "ambiguous_payment": context.get("ambiguous_payment"),
+                "ledger_summary": context.get("ledger_summary", {}),
+                "sequence_integrity": context.get("sequence_integrity", {}),
+                "allocator_diagnostics": context.get("allocator_diagnostics", {}),
+                "existing_sheet_rows": context.get("existing_sheet_rows", []),
                 "precedents": context.get("precedents", []),
             },
             "instructions": (

@@ -527,10 +527,11 @@ class ReviewManager:
     def sync_resolutions(self) -> dict[str, Any]:
         worksheet = self._get_revisiones_sheet()
         if worksheet is None:
-            return {"synced": 0, "errors": []}
+            return {"synced": 0, "removed_stale": 0, "errors": []}
         rows = worksheet.get_all_values()
 
         synced = 0
+        removed_stale = 0
         errors: list[str] = []
         rows_to_delete: list[int] = []
 
@@ -554,10 +555,18 @@ class ReviewManager:
                     raise ValueError(f"case_id inválido: {case_id}")
                 pending_review_id = int(match.group(1))
 
-                open_reviews = self.context.get_all_open_reviews()
-                pending = next((r for r in open_reviews if int(r["id"]) == pending_review_id), None)
+                pending = self.context.get_pending_review_by_id(pending_review_id)
                 if pending is None:
+                    if self.context.has_review_resolution(case_id):
+                        rows_to_delete.append(idx)
+                        removed_stale += 1
+                        continue
                     raise ValueError(f"No se encontró pending_review abierto para {case_id}")
+
+                if pending.get("status") != "open":
+                    rows_to_delete.append(idx)
+                    removed_stale += 1
+                    continue
 
                 context_json = json.loads(pending.get("context_json") or "{}")
                 similarity = self._extract_similarity_fields(pending.get("reason", ""), context_json)
@@ -587,4 +596,4 @@ class ReviewManager:
         for row_num in sorted(rows_to_delete, reverse=True):
             worksheet.delete_rows(row_num)
 
-        return {"synced": synced, "errors": errors}
+        return {"synced": synced, "removed_stale": removed_stale, "errors": errors}

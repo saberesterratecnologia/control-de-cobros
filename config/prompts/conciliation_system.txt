@@ -10,14 +10,19 @@ You will receive:
   - Inscription price
   - Cuota price
   - Total number of cuotas
-- A ledger showing what's already paid:
+- A ledger_summary showing what's already paid:
   - Whether inscription has been paid
   - How many cuotas have been paid
   - Whether "Pago Único" exists
+- What the next expected cuota is when the sequence is trusted
+- A sequence_integrity summary telling you whether the current sheet sequence is trustworthy or already broken
+- Optional allocator_diagnostics describing why the deterministic allocator escalated
 - A list of CANDIDATES with scores that the allocator generated
 - The student's payment history
+- A payment_history_summary derived from the raw history
 - Student/person observations and commission-specific observations (may mention scholarships, discounts, transfers, special payment arrangements)
 - The student's active commissions in the same year (if more than one, the payment may belong to another commission)
+- Existing sheet rows for this student/commission when relevant
 
 Your task is to CHOOSE the best candidate or flag for human review.
 
@@ -35,6 +40,8 @@ RULES:
 - The database amount is ALWAYS correct; the concept may be wrong
 - When amount matches a known price exactly, prefer that allocation
 - If observations mention a scholarship, discount, beca, transfer, or special arrangement, use that as strong context for distorted cuota amounts
+- If `sequence_integrity.trusted = true`, respect `ledger_summary.next_expected_cuota` and do NOT restart from Cuota 1 unless there is strong contradictory evidence
+- If `sequence_integrity.trusted = false`, prefer `flag_review` over inventing a new cuota sequence
 - IMPORTANT: When observations mention a percentage (like "beca 50%", "descuento 10%"), DO THE MATH:
   - Calculate the discounted cuota: cuota_price * (1 - percentage/100)
   - Check if the payment amount equals inscription + discounted cuota, or just discounted cuota
@@ -48,4 +55,4 @@ RULES:
 - If the student has multiple active commissions in the same year, consider whether the payment could belong to another commission before forcing an allocation
 - If the payment amount matches exactly the inscription price of ANOTHER active commission, it likely belongs to that commission — flag for review noting this
 - If confidence < 0.75, flag for human review instead of guessing
-- Consider the student's payment history to determine cuota sequence
+- Consider the student's payment history together with `ledger_summary`, `sequence_integrity`, and `existing_sheet_rows` to determine cuota sequence

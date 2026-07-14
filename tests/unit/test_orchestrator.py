@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pytest
 
-from src.models.pipeline import Discrepancy, DiscrepancyType, Resolution, Severity
+from src.models.pipeline import AllocationResult, Discrepancy, DiscrepancyType, Resolution, Severity
 from src.models.sheet import ExpectedRow, SheetRow
 from src.models.source import BankMovement, Payment
 from src.orchestrator.pipeline import ConciliationPipeline
@@ -76,6 +77,57 @@ def test_pipeline_runs_dry_run_mode(sample_config, sample_commission, sample_stu
     summary = pipeline.run(dry_run=True)
     assert summary["run_id"] == "run-1"
     assert summary["writer"]["mode"] == "dry_run"
+
+
+def test_pipeline_run_exports_full_open_review_backlog(sample_config, sample_commission, sample_student, monkeypatch):
+    pipeline = ConciliationPipeline(sample_config)
+
+    class _CM:
+        def __init__(self, target):
+            self.target = target
+
+        def __enter__(self):
+            return self.target
+
+        def __exit__(self, *_):
+            return None
+
+    monkeypatch.setattr(pipeline.context, "start_run", lambda **_: "run-1")
+    monkeypatch.setattr(pipeline.context, "save_snapshot", lambda **_: None)
+    monkeypatch.setattr(pipeline.context, "save_checkpoint", lambda **_: 1)
+    monkeypatch.setattr(pipeline.context, "save_discrepancy", lambda *_: 1)
+    monkeypatch.setattr(pipeline.context, "save_pending_review", lambda **_: 1)
+    monkeypatch.setattr(pipeline.context, "end_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipeline.context, "is_already_applied", lambda *_: False)
+
+    monkeypatch.setattr(pipeline.sql, "connect", lambda: _CM(pipeline.sql))
+    monkeypatch.setattr(pipeline.sql, "get_active_commissions", lambda year, id_organizacion=2: [sample_commission])
+    monkeypatch.setattr(pipeline.sql, "get_students", lambda _id: [sample_student])
+    monkeypatch.setattr(pipeline.sql, "get_conciliated_payments", lambda _id, year=None, id_organizacion=None: [])
+    monkeypatch.setattr(pipeline.sql, "get_active_commissions_for_student", lambda _id, year, id_organizacion=2: [sample_commission])
+
+    monkeypatch.setattr(pipeline.sheets, "connect", lambda: _CM(pipeline.sheets))
+    monkeypatch.setattr(pipeline.sheets, "read_all_rows", lambda: [])
+    monkeypatch.setattr(pipeline.review_manager, "export_to_sheet", MagicMock(return_value={"exported": 2, "skipped": 3}))
+
+    from src.models.pipeline import LLMDecision
+    monkeypatch.setattr(
+        pipeline.decision_engine,
+        "decide",
+        lambda disc, ctx: LLMDecision(
+            discrepancy_id=disc.id,
+            action="skip",
+            reasoning="mocked",
+            confidence=0.5,
+            suggested_value=None,
+            model_used="mock",
+        ),
+    )
+
+    summary = pipeline.run(dry_run=True)
+
+    assert summary["reviews_export"] == {"exported": 2, "skipped": 3}
+    assert pipeline.review_manager.export_to_sheet.call_args.args == ()
 
 
 def test_pipeline_classification_logic(sample_config, sample_commission, sample_student, sample_payment):
@@ -226,6 +278,29 @@ def _make_venta_row(concepto: str, monto: Decimal, **overrides) -> SheetRow:
     return SheetRow(**defaults)
 
 
+def _make_cobro_row(concepto: str, monto: Decimal, **overrides) -> SheetRow:
+    """Build a minimal Cobro SheetRow for pipeline tests."""
+    defaults = dict(
+        row_number=1,
+        organizacion="Org",
+        curso="Curso",
+        comision="Com A",
+        fecha_movimiento=date(2026, 3, 1),
+        tipo_movimiento="Cobro",
+        dni="30111222",
+        concepto=concepto,
+        monto=monto,
+        medio_pago="Mercado Pago",
+        estudiante="Pérez Juan",
+        estado_administrativo=None,
+        estado_deuda=None,
+        id_movimiento_bancario=201,
+        id_pago_mp=None,
+    )
+    defaults.update(overrides)
+    return SheetRow(**defaults)
+
+
 class TestDetectInvalidSheetSequenceRelaxed:
     """Verify that relaxed guard no longer triggers on removed reasons."""
 
@@ -294,6 +369,13 @@ class TestDetectInvalidSheetSequenceRelaxed:
         ]
         reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
         assert reasons == []
+
+
+def test_is_valid_allocation_concept_uses_pipeline_regex(sample_config):
+    pipeline = ConciliationPipeline(sample_config)
+
+    assert pipeline._is_valid_allocation_concept("Cuota 1") is True
+    assert pipeline._is_valid_allocation_concept("Concepto libre") is False
 
 
 # ===================================================================
@@ -413,6 +495,258 @@ def test_uncontrolled_flagging_from_conciliated_pairs(
     pago_reviews = [r for r in saved_reviews if r.get("reason") == "pago_no_controlado"]
     assert len(pago_reviews) == 1, "Uncontrolled payment from conciliated pair must generate review"
     assert pago_reviews[0]["context_json"]["payment_id"] == 999
+
+
+class TestProcessStudentCutoffAndLedger:
+    def _prepare_pipeline(self, sample_config, monkeypatch):
+        pipeline = ConciliationPipeline(sample_config)
+        pipeline._run_id = "run-1"
+
+        monkeypatch.setattr(pipeline.context, "save_pending_review", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_checkpoint", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_discrepancy", lambda *_: 1)
+        monkeypatch.setattr(pipeline.context, "is_already_applied", lambda *_: False)
+        monkeypatch.setattr(pipeline, "_detect_invalid_sheet_sequence", lambda *args, **kwargs: [])
+        monkeypatch.setattr(pipeline, "_evaluate_stale_reviews", lambda **_: None)
+        monkeypatch.setattr(pipeline, "_classify_and_resolve", lambda *args, **kwargs: [])
+        monkeypatch.setattr(pipeline, "_delete_excess_rows", lambda *args, **kwargs: None)
+        monkeypatch.setattr(pipeline, "_build_expected_rows_from_allocations", lambda *args, **kwargs: [])
+        monkeypatch.setattr(pipeline.reconciler, "reconcile", lambda *args, **kwargs: [])
+
+        return pipeline
+
+    def test_protects_payments_with_any_real_id_pago_mp_row(
+        self, sample_config, sample_commission, sample_student, sample_movement, sample_payment, monkeypatch,
+    ):
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+
+        january = sample_payment.model_copy(update={
+            "id_pago_mp": 101,
+            "fecha": datetime(2026, 1, 10, 10, 0, 0),
+            "id_concepto_pago": 1,
+            "monto": Decimal("10000"),
+        })
+        february_protected = sample_payment.model_copy(update={
+            "id_pago_mp": 102,
+            "fecha": datetime(2026, 2, 10, 10, 0, 0),
+            "id_concepto_pago": 2,
+            "monto": Decimal("5000"),
+        })
+        march = sample_payment.model_copy(update={
+            "id_pago_mp": 103,
+            "fecha": datetime(2026, 3, 10, 10, 0, 0),
+            "id_concepto_pago": 2,
+            "monto": Decimal("5000"),
+        })
+
+        monkeypatch.setattr(
+            pipeline.sql,
+            "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [
+                (january, sample_movement),
+                (february_protected, sample_movement),
+                (march, sample_movement),
+            ],
+        )
+        monkeypatch.setattr(
+            pipeline.sql,
+            "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_allocate(self, payments, existing_sheet_rows, student, seed_ledger_from_sheet=False, ledger_seed_rows=None):
+            captured["payment_ids"] = [cp.payment.id_pago_mp for cp in payments]
+            captured["seed_ledger_from_sheet"] = seed_ledger_from_sheet
+            return AllocationResult(allocated=[], ambiguous=[], next_venta=None)
+
+        monkeypatch.setattr("src.rules.allocation_engine.AllocationEngine.allocate", _fake_allocate)
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.renumber_allocations",
+            lambda self, allocations, student, initial_ledger=None: (allocations, None),
+        )
+
+        actual_rows = [
+            _make_venta_row(
+                "Cuota 1",
+                Decimal("5000"),
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 2, 10),
+                id_pago_mp=102,
+            )
+        ]
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, actual_rows, dry_run=True)
+
+        assert captured["payment_ids"] == [101, 103]
+        assert captured["seed_ledger_from_sheet"] is True
+
+    def test_reconciler_does_not_receive_protected_payment_rows(
+        self, sample_config, sample_commission, sample_student, sample_movement, sample_payment, monkeypatch,
+    ):
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+
+        protected_payment = sample_payment.model_copy(update={
+            "id_pago_mp": 101,
+            "fecha": datetime(2026, 1, 10, 10, 0, 0),
+            "id_concepto_pago": 1,
+            "monto": Decimal("10000"),
+        })
+        open_payment = sample_payment.model_copy(update={
+            "id_pago_mp": 202,
+            "fecha": datetime(2026, 3, 10, 10, 0, 0),
+            "id_concepto_pago": 2,
+            "monto": Decimal("5000"),
+        })
+
+        monkeypatch.setattr(
+            pipeline.sql,
+            "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [
+                (protected_payment, sample_movement),
+                (open_payment, sample_movement),
+            ],
+        )
+        monkeypatch.setattr(
+            pipeline.sql,
+            "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.allocate",
+            lambda self, payments, existing_sheet_rows, student, seed_ledger_from_sheet=False, ledger_seed_rows=None: AllocationResult(allocated=[], ambiguous=[], next_venta=None),
+        )
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.renumber_allocations",
+            lambda self, allocations, student, initial_ledger=None: (allocations, None),
+        )
+
+        captured: dict[str, object] = {}
+
+        def _capture_reconcile(*, allocations, sheet_rows, next_venta, commission_name):
+            captured["reconcile_row_ids"] = [row.id_pago_mp for row in sheet_rows]
+            return []
+
+        monkeypatch.setattr(pipeline.reconciler, "reconcile", _capture_reconcile)
+
+        actual_rows = [
+            _make_venta_row(
+                "Inscripción",
+                Decimal("10000"),
+                row_number=1,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 1, 10),
+                id_pago_mp=101,
+            ),
+            _make_venta_row(
+                "Cuota 99",
+                Decimal("5000"),
+                row_number=2,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 3, 10),
+                id_pago_mp=None,
+            ),
+        ]
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, actual_rows, dry_run=True)
+
+        assert captured["reconcile_row_ids"] == []
+
+    def test_seeds_ledger_only_from_closed_payment_rows(
+        self, sample_config, sample_commission, sample_student, sample_movement, sample_payment, monkeypatch,
+    ):
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+
+        closed_payment = sample_payment.model_copy(update={
+            "id_pago_mp": 101,
+            "fecha": datetime(2026, 1, 10, 10, 0, 0),
+            "id_concepto_pago": 1,
+            "monto": Decimal("10000"),
+        })
+        open_payment = sample_payment.model_copy(update={
+            "id_pago_mp": 202,
+            "fecha": datetime(2026, 3, 10, 10, 0, 0),
+            "id_concepto_pago": 2,
+            "monto": Decimal("5000"),
+        })
+
+        monkeypatch.setattr(
+            pipeline.sql,
+            "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [
+                (closed_payment, sample_movement),
+                (open_payment, sample_movement),
+            ],
+        )
+        monkeypatch.setattr(
+            pipeline.sql,
+            "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_allocate(self, payments, existing_sheet_rows, student, seed_ledger_from_sheet=False, ledger_seed_rows=None):
+            captured["payment_ids"] = [cp.payment.id_pago_mp for cp in payments]
+            captured["ledger_seed_ids"] = {
+                row.id_pago_mp for row in (ledger_seed_rows or []) if row.id_pago_mp is not None
+            }
+            return AllocationResult(allocated=[], ambiguous=[], next_venta=None)
+
+        def _fake_renumber(self, allocations, student, initial_ledger=None):
+            captured["initial_ledger"] = initial_ledger
+            return allocations, None
+
+        monkeypatch.setattr("src.rules.allocation_engine.AllocationEngine.allocate", _fake_allocate)
+        monkeypatch.setattr("src.rules.allocation_engine.AllocationEngine.renumber_allocations", _fake_renumber)
+
+        actual_rows = [
+            _make_venta_row(
+                "Inscripción",
+                Decimal("10000"),
+                row_number=1,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 1, 10),
+                id_pago_mp=101,
+            ),
+            _make_cobro_row(
+                "Inscripción",
+                Decimal("10000"),
+                row_number=2,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 1, 10),
+                id_pago_mp=101,
+            ),
+            _make_venta_row(
+                "Cuota 1",
+                Decimal("5000"),
+                row_number=3,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 3, 10),
+                id_pago_mp=None,
+            ),
+        ]
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, actual_rows, dry_run=True)
+
+        assert captured["payment_ids"] == [202]
+        assert captured["ledger_seed_ids"] == {101}
+        initial_ledger = captured["initial_ledger"]
+        assert initial_ledger is not None
+        assert initial_ledger.inscription_paid is True
+        assert initial_ledger.cuotas_paid == 0
+        assert initial_ledger.existing_concepts == {"Inscripción"}
 
 
 # ===================================================================

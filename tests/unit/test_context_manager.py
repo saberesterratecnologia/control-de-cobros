@@ -261,3 +261,46 @@ class TestCloseReview:
             assert row is not None
             assert dict(row)["status"] == "resolved"
             assert dict(row)["reviewer_notes"] == "auto_close:guard_resolved"
+
+
+def test_review_resolution_upserts_by_case_id_and_helpers() -> None:
+    with ContextManager(":memory:", schema_path=_schema_path()) as mgr:
+        run_id = mgr.start_run()
+        review_id = mgr.save_pending_review(run_id, None, "ambiguous_allocation:auto", {"commission": "Com A", "dni": "30111222"})
+
+        pending = mgr.get_pending_review_by_id(review_id)
+        assert pending is not None
+        assert pending["id"] == review_id
+
+        mgr.save_review_resolution(
+            case_id="REV-1",
+            run_id=run_id,
+            commission="Com A",
+            dni="30111222",
+            problem="Problema 1",
+            resolution="Primera",
+            monto=10000.0,
+            concepto_tipo="cuota",
+            pricing_inscripcion=None,
+            pricing_cuota=10000.0,
+            monto_ratio=1.0,
+        )
+        mgr.save_review_resolution(
+            case_id="REV-1",
+            run_id=run_id,
+            commission="Com A",
+            dni="30111222",
+            problem="Problema 1",
+            resolution="Segunda",
+            monto=10000.0,
+            concepto_tipo="cuota",
+            pricing_inscripcion=None,
+            pricing_cuota=10000.0,
+            monto_ratio=1.0,
+        )
+
+        assert mgr.has_review_resolution("REV-1") is True
+        conn = mgr._require_connection()
+        rows = conn.execute("SELECT * FROM review_resolutions WHERE case_id = 'REV-1'").fetchall()
+        assert len(rows) == 1
+        assert dict(rows[0])["resolution"] == "Segunda"

@@ -297,3 +297,28 @@ def test_few_shot_examples_included_in_prompt() -> None:
     # 5 examples => 10 messages + 1 user payload + system
     assert len(messages) == 12
     assert messages[-1]["role"] == "user"
+
+
+def test_prompt_includes_derived_history_and_sequence_context() -> None:
+    context = MagicMock()
+    engine = DecisionEngine(_config(), context)
+
+    rich_context = {
+        **_context_data(),
+        "payment_history_summary": {"total_payments": 3},
+        "active_commissions": [{"nombre": "Com B"}],
+        "ledger_summary": {"cuotas_paid": 3, "next_expected_cuota": 4},
+        "sequence_integrity": {"trusted": True, "guard_reasons": []},
+        "allocator_diagnostics": {"path": "ambiguous_allocation"},
+        "existing_sheet_rows": [{"row_number": 10, "concepto": "Cuota 3"}],
+    }
+
+    messages = engine._build_prompt(_discrepancy(), rich_context)
+    payload = json.loads(messages[-1]["content"])
+
+    assert payload["context"]["payment_history_summary"]["total_payments"] == 3
+    assert payload["context"]["active_commissions"][0]["nombre"] == "Com B"
+    assert payload["context"]["ledger_summary"]["next_expected_cuota"] == 4
+    assert payload["context"]["sequence_integrity"]["trusted"] is True
+    assert payload["context"]["allocator_diagnostics"]["path"] == "ambiguous_allocation"
+    assert payload["context"]["existing_sheet_rows"][0]["row_number"] == 10

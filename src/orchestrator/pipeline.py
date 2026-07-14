@@ -29,7 +29,7 @@ from src.models.pipeline import (
 )
 from src.models.sheet import ExpectedRow, SheetRow
 from src.models.source import BankMovement, Commission, Payment, Student
-from src.rules.allocation_engine import AllocationEngine
+from src.rules.allocation_engine import AllocationEngine, Ledger
 from src.rules.mappers import map_cobro_medio, map_estado_administrativo, map_medio
 from src.rules.normalizer import SheetNormalizer
 from src.reviews.review_manager import ReviewManager
@@ -164,7 +164,9 @@ class ConciliationPipeline:
                     summary["writer"] = cumulative_write_result
 
                 if not skip_reviews:
-                    summary["reviews_export"] = self.review_manager.export_to_sheet(self._run_id)
+                    # Export the full open backlog on every run so REVISIONES
+                    # can self-heal after manual clears or skipped exports.
+                    summary["reviews_export"] = self.review_manager.export_to_sheet()
                 else:
                     summary["reviews_export"] = {"exported": 0, "skipped": 0, "skipped_by_flag": True}
 
@@ -387,77 +389,52 @@ class ConciliationPipeline:
 
         # --- Skip payments already reflected in the sheet ---
         # Strategy: find the most recent payment that has a Cobro with its
-        # id_pago_mp in the sheet.  Everything up to (and including) that
-        # payment's date is considered settled — the sheet already reflects
-        # it correctly (whether written by the agent or manually).
-        # Only payments AFTER that cutoff date are processed.
-        # This avoids re-interpreting manual splits and legacy rows.
+        # Any real id_pago_mp already present in the student's sheet rows
+        # protects that payment from re-allocation. This avoids re-touching
+        # payments that the sheet already linked explicitly, even if some rows
+        # around them were loaded manually or by older agent behavior.
         # Use --force-reprocess to override this and process everything.
-        closed_pago_ids: set[int] = set()
-        closed_allocations: list[Allocation] = []
+        protected_pago_ids: set[int] = set()
+        ledger_seed_rows: list[SheetRow] = []
         if not force_reprocess:
-            # Collect all id_pago_mp present in Cobro rows of the sheet,
-            # but only those that correspond to real payment IDs for this
-            # student.  Legacy rows may have id_movimiento_bancario in
-            # column N which produces false IDs.
+            # Only trust ids that correspond to real payments for this student;
+            # legacy/manual rows may carry stray values in the id columns.
             real_payment_ids = {cp.payment.id_pago_mp for cp in enriched_conciliated}
-            cobro_pago_ids: set[int] = set()
-            for row in actual_rows:
-                if row.id_pago_mp is None or row.id_pago_mp <= 0:
-                    continue
-                if row.id_pago_mp not in real_payment_ids:
-                    continue
-                tipo = (row.tipo_movimiento or "").strip().casefold()
-                if tipo == "cobro":
-                    cobro_pago_ids.add(row.id_pago_mp)
+            protected_pago_ids = self._collect_protected_payment_ids(actual_rows, real_payment_ids)
 
-            # Find the cutoff: the date of the most recent payment that has
-            # a Cobro in the sheet.  All payments on or before this date are
-            # considered already settled.
-            cutoff_date = None
-            if cobro_pago_ids:
-                for cp in enriched_conciliated:
-                    if cp.payment.id_pago_mp in cobro_pago_ids:
-                        pago_date = cp.payment.fecha.date() if hasattr(cp.payment.fecha, "date") else cp.payment.fecha
-                        if cutoff_date is None or pago_date > cutoff_date:
-                            cutoff_date = pago_date
-
-            if cutoff_date is not None:
-                # All payments on or before the cutoff are closed
+            if protected_pago_ids:
                 before_count = len(enriched_conciliated)
                 enriched_conciliated = [
                     cp for cp in enriched_conciliated
-                    if (cp.payment.fecha.date() if hasattr(cp.payment.fecha, "date") else cp.payment.fecha) > cutoff_date
+                    if cp.payment.id_pago_mp not in protected_pago_ids
                 ]
-                skipped_closed = before_count - len(enriched_conciliated)
-                closed_pago_ids = cobro_pago_ids  # Track for ledger seeding decision
-                if skipped_closed:
+                skipped_protected = before_count - len(enriched_conciliated)
+                ledger_seed_rows = [
+                    row
+                    for row in actual_rows
+                    if row.id_pago_mp is not None and row.id_pago_mp in protected_pago_ids
+                ]
+                if skipped_protected:
                     LOGGER.info(
-                        "%s DNI=%s: skipped %d payments on or before cutoff %s (sheet already settled)",
+                        "%s DNI=%s: protected %d payments already linked by id_pago_mp",
                         commission.nombre.strip(),
                         student.dni.strip(),
-                        skipped_closed,
-                        cutoff_date.isoformat(),
+                        skipped_protected,
                     )
 
-        # When payments are skipped via cutoff, initialize the ledger from
-        # the sheet's existing Venta rows so the engine knows what cuotas
-        # are covered.  Also filter actual_rows so the reconciler does NOT
-        # see pre-cutoff rows (they are already settled and must not be
-        # touched — they may be manual splits that differ from DB concepts).
-        use_sheet_ledger = not force_reprocess and cutoff_date is not None
-        if cutoff_date is not None:
-            # Protect all existing rows — the reconciler should only see
-            # rows written AFTER the cutoff (i.e., rows from previous agent
-            # runs that have id_pago_mp and are not already settled).
+        # Protected payment ids seed the ledger and stay out of reconciliation.
+        # Rows without id_pago_mp also stay out when protections exist because
+        # they may be legacy/manual representations of those same payments.
+        use_sheet_ledger = not force_reprocess and bool(protected_pago_ids)
+        if protected_pago_ids:
             actual_rows_for_reconciler = [
                 row for row in actual_rows
                 if row.id_pago_mp is not None
                 and row.id_pago_mp > 0
-                and row.id_pago_mp not in cobro_pago_ids
+                and row.id_pago_mp not in protected_pago_ids
             ]
         elif not force_reprocess and actual_rows:
-            # No cutoff (no real Cobro with id_pago_mp found) but the
+            # No protected payment ids were found, but the
             # student already has rows in the sheet.  Check if any rows
             # have a REAL id_pago_mp (matching an actual payment).
             has_any_real_pago_id = any(
@@ -486,6 +463,7 @@ class ConciliationPipeline:
             existing_sheet_rows=actual_rows,
             student=student,
             seed_ledger_from_sheet=use_sheet_ledger,
+            ledger_seed_rows=ledger_seed_rows if use_sheet_ledger else None,
         )
 
         student_active_commissions = self.sql.get_active_commissions_for_student(
@@ -494,7 +472,7 @@ class ConciliationPipeline:
             id_organizacion=commission.id_organizacion,
         )
 
-        resolved_allocations = list(closed_allocations) + list(allocation_result.allocated)
+        resolved_allocations = list(allocation_result.allocated)
         unresolved_ambiguous: list[AmbiguousPayment] = []
         for ambiguous in allocation_result.ambiguous:
             resolved = self._resolve_ambiguous(
@@ -503,6 +481,8 @@ class ConciliationPipeline:
                 commission,
                 all_payments,
                 student_active_commissions,
+                sheet_rows=actual_rows,
+                current_guard_reasons=current_guard_reasons,
             )
             if resolved:
                 resolved_allocations.extend(resolved)
@@ -513,11 +493,10 @@ class ConciliationPipeline:
         # After all ambiguous payments are resolved, renumber cuotas
         # chronologically and recompute next_venta with the correct
         # ledger state and a business-derived reference date.
-        # When a cutoff was applied, seed the renumbering ledger from the
-        # sheet so cuota ordinals continue from the pre-existing state
-        # instead of restarting at 1.
-        from src.rules.allocation_engine import Ledger
-        sheet_ledger = Ledger.from_sheet_rows(actual_rows) if use_sheet_ledger else None
+        # When settled payment IDs were skipped, seed the renumbering ledger
+        # from those settled rows so cuota ordinals continue from the
+        # pre-existing state instead of restarting at 1.
+        sheet_ledger = Ledger.from_sheet_rows(ledger_seed_rows) if use_sheet_ledger else None
         resolved_allocations, next_venta = allocator.renumber_allocations(
             resolved_allocations, student, initial_ledger=sheet_ledger,
         )
@@ -534,6 +513,8 @@ class ConciliationPipeline:
             commission,
             all_payments,
             sheet_rows=actual_rows_for_reconciler,
+            ledger_rows=actual_rows,
+            current_guard_reasons=current_guard_reasons,
         )
 
         # Deduplicate: if the sheet has more rows than expected for this student,
@@ -762,6 +743,18 @@ class ConciliationPipeline:
         return int(match.group(1)) if match else None
 
     @staticmethod
+    def _collect_protected_payment_ids(actual_rows: list[SheetRow], real_payment_ids: set[int]) -> set[int]:
+        """Return real payment ids already linked in the student's sheet rows."""
+        protected_pago_ids: set[int] = set()
+        for row in actual_rows:
+            if row.id_pago_mp is None or row.id_pago_mp <= 0:
+                continue
+            if row.id_pago_mp not in real_payment_ids:
+                continue
+            protected_pago_ids.add(row.id_pago_mp)
+        return protected_pago_ids
+
+    @staticmethod
     def _is_close_amount(actual: Decimal, target: Decimal, tolerance: Decimal = Decimal("0.02")) -> bool:
         if target <= 0:
             return False
@@ -835,6 +828,8 @@ class ConciliationPipeline:
         commission: Commission,
         payments: list[Payment],
         student_active_commissions: list[Commission],
+        sheet_rows: list[SheetRow] | None = None,
+        current_guard_reasons: list[str] | None = None,
     ) -> list[Allocation]:
         """Send ambiguous payment to LLM for resolution.
 
@@ -886,6 +881,15 @@ class ConciliationPipeline:
             commission,
             payments,
             student_active_commissions,
+            sheet_rows=sheet_rows,
+            ledger_rows=sheet_rows,
+            guard_reasons=current_guard_reasons,
+            allocator_diagnostics=self._build_allocator_diagnostics(
+                ambiguous,
+                commission,
+                sheet_rows or [],
+                current_guard_reasons,
+            ),
         )
         llm_context["ambiguous_payment"] = {
             "payment": ambiguous.payment.model_dump(mode="json"),
@@ -996,6 +1000,8 @@ class ConciliationPipeline:
         commission: Commission,
         payments: list[Payment],
         sheet_rows: list[SheetRow] | None = None,
+        ledger_rows: list[SheetRow] | None = None,
+        current_guard_reasons: list[str] | None = None,
     ) -> list[Any]:
         resolved: list[Any] = []
         assert self._run_id is not None
@@ -1090,7 +1096,15 @@ class ConciliationPipeline:
                 self._counters.auto_fix += 1
                 self._plan_autofix(discrepancy)
             elif discrepancy.confidence >= self.llm_threshold:
-                llm_context = self._build_context_for_llm(discrepancy, student, commission, payments)
+                llm_context = self._build_context_for_llm(
+                    discrepancy,
+                    student,
+                    commission,
+                    payments,
+                    sheet_rows=sheet_rows,
+                    ledger_rows=ledger_rows,
+                    guard_reasons=current_guard_reasons,
+                )
                 decision = self.decision_engine.decide(discrepancy, llm_context)
                 if decision.action == "fix":
                     discrepancy.resolution = Resolution.LLM_DECIDED
@@ -1109,6 +1123,8 @@ class ConciliationPipeline:
                 llm_context = self._build_context_for_llm(
                     discrepancy, student, commission, payments,
                     sheet_rows=sheet_rows,
+                    ledger_rows=ledger_rows,
+                    guard_reasons=current_guard_reasons,
                 )
                 decision = self.decision_engine.decide(discrepancy, llm_context)
                 if decision.action == "fix":
@@ -1177,9 +1193,13 @@ class ConciliationPipeline:
         payments: list[Payment],
         student_active_commissions: list[Commission] | None = None,
         sheet_rows: list[SheetRow] | None = None,
+        ledger_rows: list[SheetRow] | None = None,
+        guard_reasons: list[str] | None = None,
+        allocator_diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payment_record = discrepancy.expected_row.source_payment if discrepancy.expected_row else None
         movement = discrepancy.expected_row.source_movement if discrepancy.expected_row else None
+        derived_rows = ledger_rows if ledger_rows is not None else (sheet_rows or [])
         context: dict[str, Any] = {
             "payment_history": [
                 {
@@ -1191,10 +1211,12 @@ class ConciliationPipeline:
                 }
                 for p in payments
             ],
+            "payment_history_summary": self._build_payment_history_summary(payments),
             "commission_prices": {
                 "inscripcion": str(commission.valor_inscripcion_promocion or ""),
                 "cuota": str(commission.valor_cuota_bonificada or ""),
                 "cantidad_cuotas": commission.cantidad_cuotas,
+                "pago_unico": str(commission.valor_pago_unico) if commission.valor_pago_unico else None,
             },
             "student_info": {
                 "id_persona": student.id_persona,
@@ -1217,6 +1239,9 @@ class ConciliationPipeline:
             ],
             "payment_record": payment_record.model_dump(mode="json") if payment_record else None,
             "bank_movement": movement.model_dump(mode="json") if movement else None,
+            "ledger_summary": self._build_ledger_summary(commission, derived_rows),
+            "sequence_integrity": self._build_sequence_integrity(commission, derived_rows, guard_reasons),
+            "allocator_diagnostics": allocator_diagnostics or {},
         }
         if sheet_rows is not None:
             context["existing_sheet_rows"] = [
@@ -1233,6 +1258,137 @@ class ConciliationPipeline:
                 for r in sheet_rows
             ]
         return context
+
+    @staticmethod
+    def _build_payment_history_summary(payments: list[Payment]) -> dict[str, Any]:
+        if not payments:
+            return {
+                "total_payments": 0,
+                "conciliated_payments": 0,
+                "unconciliated_payments": 0,
+                "uncontrolled_payments": 0,
+                "total_reported_amount": "0",
+                "first_payment_date": None,
+                "last_payment_date": None,
+                "db_concept_counts": {"inscripcion": 0, "cuota": 0, "other": 0},
+            }
+
+        payment_dates = [payment.fecha for payment in payments if payment.fecha is not None]
+        concept_counts = {"inscripcion": 0, "cuota": 0, "other": 0}
+        conciliated = 0
+        uncontrolled = 0
+        total_amount = Decimal("0")
+
+        for payment in payments:
+            total_amount += payment.monto or Decimal("0")
+            if payment.id_movimiento_bancario is not None and payment.id_movimiento_bancario > 0:
+                conciliated += 1
+            if not payment.controlado:
+                uncontrolled += 1
+
+            if payment.id_concepto_pago == 1:
+                concept_counts["inscripcion"] += 1
+            elif payment.id_concepto_pago in (2, 4):
+                concept_counts["cuota"] += 1
+            else:
+                concept_counts["other"] += 1
+
+        return {
+            "total_payments": len(payments),
+            "conciliated_payments": conciliated,
+            "unconciliated_payments": len(payments) - conciliated,
+            "uncontrolled_payments": uncontrolled,
+            "total_reported_amount": str(total_amount),
+            "first_payment_date": min(payment_dates).isoformat() if payment_dates else None,
+            "last_payment_date": max(payment_dates).isoformat() if payment_dates else None,
+            "db_concept_counts": concept_counts,
+        }
+
+    def _build_ledger_summary(self, commission: Commission, rows: list[SheetRow]) -> dict[str, Any]:
+        ledger = Ledger.from_sheet_rows(rows)
+        protected_payment_ids = sorted(
+            {
+                row.id_pago_mp
+                for row in rows
+                if row.id_pago_mp is not None and row.id_pago_mp > 0
+            }
+        )
+        cuota_numbers = sorted(
+            {
+                cuota_n
+                for row in rows
+                if (row.tipo_movimiento or "").strip().casefold() == "venta"
+                for cuota_n in [self._extract_cuota_number(row.concepto)]
+                if cuota_n is not None
+            }
+        )
+        total_cuotas = commission.cantidad_cuotas or 0
+        next_expected_cuota = None
+        remaining_cuotas = None
+        if total_cuotas > 0 and not ledger.pago_unico:
+            remaining_cuotas = max(total_cuotas - ledger.cuotas_paid, 0)
+            if remaining_cuotas > 0:
+                next_expected_cuota = ledger.cuotas_paid + 1
+
+        return {
+            "inscription_paid": ledger.inscription_paid,
+            "cuotas_paid": ledger.cuotas_paid,
+            "pago_unico_present": ledger.pago_unico,
+            "fully_paid": ledger.fully_paid,
+            "existing_concepts": sorted(ledger.existing_concepts),
+            "existing_cuota_numbers": cuota_numbers,
+            "protected_payment_ids": protected_payment_ids,
+            "protected_payment_count": len(protected_payment_ids),
+            "next_expected_cuota": next_expected_cuota,
+            "remaining_cuotas": remaining_cuotas,
+            "source_row_count": len(rows),
+            "venta_row_count": sum(1 for row in rows if (row.tipo_movimiento or "").strip().casefold() == "venta"),
+            "cobro_row_count": sum(1 for row in rows if (row.tipo_movimiento or "").strip().casefold() == "cobro"),
+        }
+
+    def _build_sequence_integrity(
+        self,
+        commission: Commission,
+        rows: list[SheetRow],
+        guard_reasons: list[str] | None = None,
+    ) -> dict[str, Any]:
+        reasons = list(guard_reasons) if guard_reasons is not None else self._detect_invalid_sheet_sequence(commission, rows)
+        duplicate_cuotas = sorted(
+            int(reason.removeprefix("duplicate_cuota_"))
+            for reason in reasons
+            if reason.startswith("duplicate_cuota_")
+        )
+        gap_reasons = [reason for reason in reasons if reason.startswith("missing_cuotas_before_")]
+        return {
+            "trusted": not reasons,
+            "guard_reasons": reasons,
+            "has_duplicates": bool(duplicate_cuotas),
+            "duplicate_cuotas": duplicate_cuotas,
+            "has_gaps": bool(gap_reasons),
+            "gap_reasons": gap_reasons,
+            "missing_inscription": "missing_inscription_with_existing_cuotas" in reasons,
+            "exceeds_total": any(reason.startswith("cuota_exceeds_total:") for reason in reasons),
+        }
+
+    def _build_allocator_diagnostics(
+        self,
+        ambiguous: AmbiguousPayment,
+        commission: Commission,
+        rows: list[SheetRow],
+        guard_reasons: list[str] | None = None,
+    ) -> dict[str, Any]:
+        ledger_summary = self._build_ledger_summary(commission, rows)
+        sequence_integrity = self._build_sequence_integrity(commission, rows, guard_reasons)
+        highest_candidate = max(ambiguous.candidates, key=lambda candidate: candidate.score) if ambiguous.candidates else None
+        return {
+            "path": "ambiguous_allocation",
+            "deterministic_allocator_failed": True,
+            "candidate_count": len(ambiguous.candidates),
+            "candidate_concepts": [candidate.concept for candidate in ambiguous.candidates],
+            "highest_scoring_candidate": highest_candidate.model_dump(mode="json") if highest_candidate else None,
+            "next_expected_cuota_from_ledger": ledger_summary.get("next_expected_cuota"),
+            "sequence_trusted": sequence_integrity.get("trusted", True),
+        }
 
     def _evaluate_stale_reviews(
         self,
@@ -1529,7 +1685,7 @@ class ConciliationPipeline:
     def _is_valid_allocation_concept(concept: str | None) -> bool:
         if not concept:
             return False
-        return bool(Pipeline._VALID_CONCEPT_RE.match(concept.strip()))
+        return bool(ConciliationPipeline._VALID_CONCEPT_RE.match(concept.strip()))
 
     def _plan_review(self, discrepancy: Discrepancy, reason: str) -> None:
         if discrepancy.actual_row is None:

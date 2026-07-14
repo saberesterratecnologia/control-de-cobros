@@ -5,7 +5,8 @@
       "payment_amount": "98640.00",
       "db_concept": "Inscripción",
       "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
-      "ledger": {"inscription_paid": true, "cuotas_paid": 1},
+      "ledger_summary": {"inscription_paid": true, "cuotas_paid": 1, "next_expected_cuota": 2},
+      "sequence_integrity": {"trusted": true, "guard_reasons": []},
       "candidates": [
         {"concept": "Inscripción", "amount": "54800.00", "score": 0.60},
         {"concept": "Cuota 2", "amount": "98640.00", "score": 0.85}
@@ -26,7 +27,8 @@
       "payment_amount": "150000.00",
       "db_concept": "Cuota",
       "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
-      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "ledger_summary": {"inscription_paid": false, "cuotas_paid": 0, "next_expected_cuota": 1},
+      "sequence_integrity": {"trusted": true, "guard_reasons": []},
       "candidates": [
         {"concept": "Inscripción", "amount": "54800.00", "score": 0.40},
         {"concept": "Cuota 1", "amount": "98640.00", "score": 0.35},
@@ -48,7 +50,8 @@
       "payment_amount": "153440.00",
       "db_concept": "Inscripción",
       "commission_prices": {"inscripcion": "54800.00", "cuota": "98640.00"},
-      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "ledger_summary": {"inscription_paid": false, "cuotas_paid": 0, "next_expected_cuota": 1},
+      "sequence_integrity": {"trusted": true, "guard_reasons": []},
       "candidates": [
         {"concept": "Inscripción", "amount": "54800.00", "score": 0.55},
         {"concept": "Cuota 1", "amount": "98640.00", "score": 0.40}
@@ -73,7 +76,8 @@
         "persona_observaciones": "",
         "comision_observaciones": "beca 50%"
       },
-      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "ledger_summary": {"inscription_paid": false, "cuotas_paid": 0, "next_expected_cuota": 1},
+      "sequence_integrity": {"trusted": true, "guard_reasons": []},
       "candidates": [
         {"concept": "Cuota 1", "amount": "98640.00", "score": 0.72},
         {"concept": "Cuota 1", "amount": "104120.00", "score": 0.76},
@@ -103,7 +107,8 @@
         {"nombre": "PERITO-S-TOTORAL-2026", "inscripcion": "54800.00", "cuota": "98640.00"},
         {"nombre": "PERITO-D-FEBRERO-2026", "inscripcion": "52050.00", "cuota": "93690.00"}
       ],
-      "ledger": {"inscription_paid": false, "cuotas_paid": 0},
+      "ledger_summary": {"inscription_paid": false, "cuotas_paid": 0, "next_expected_cuota": 1},
+      "sequence_integrity": {"trusted": true, "guard_reasons": []},
       "candidates": [
         {"concept": "Inscripción", "amount": "54800.00", "score": 0.74},
         {"concept": "Inscripción", "amount": "52050.00", "score": 0.60}

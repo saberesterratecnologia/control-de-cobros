@@ -18,6 +18,7 @@ from src.models.pipeline import (
     AmbiguousPayment,
     ConciliatedPayment,
 )
+from src.models.sheet import SheetRow
 from src.models.source import BankMovement, Commission, Payment, Student
 from src.orchestrator.pipeline import ConciliationPipeline
 
@@ -107,6 +108,26 @@ def _ambiguous(monto: str = "500000") -> AmbiguousPayment:
     )
 
 
+def _sheet_row(row_number: int, tipo: str, concepto: str, monto: str, *, id_pago_mp: int | None = None) -> SheetRow:
+    return SheetRow(
+        row_number=row_number,
+        organizacion="Org",
+        curso="Curso",
+        comision="Comisión Test",
+        fecha_movimiento=date(2026, 3, 15),
+        tipo_movimiento=tipo,
+        dni="12345678",
+        concepto=concepto,
+        monto=Decimal(monto),
+        medio_pago="Mercado Pago" if tipo == "Cobro" else "No aplica",
+        estudiante="Student Test",
+        estado_administrativo=None,
+        estado_deuda=None,
+        id_movimiento_bancario=200 if tipo == "Cobro" else None,
+        id_pago_mp=id_pago_mp,
+    )
+
+
 @pytest.fixture()
 def pipeline():
     """Build a ConciliationPipeline with mocked dependencies for unit tests."""
@@ -193,3 +214,34 @@ class TestCommissionPricesInContext:
         assert "commission_prices" in context_json, "commission_prices missing from context_json"
         pago_unico = context_json["commission_prices"].get("pago_unico")
         assert pago_unico is None, f"pago_unico should be None when valor_pago_unico is None, got {pago_unico}"
+
+    def test_ambiguous_llm_context_includes_ledger_and_allocator_state(self, pipeline) -> None:
+        commission = _commission(pago_unico=None)
+        ambiguous = _ambiguous(monto="10000")
+        sheet_rows = [
+            _sheet_row(1, "Venta", "Inscripción", "52050"),
+            _sheet_row(2, "Venta", "Cuota 1", "10000"),
+            _sheet_row(3, "Venta", "Cuota 2", "10000"),
+            _sheet_row(4, "Venta", "Cuota 3", "10000"),
+        ]
+
+        pipeline._resolve_ambiguous(
+            ambiguous,
+            _student(),
+            commission,
+            [_payment("10000")],
+            [commission],
+            sheet_rows=sheet_rows,
+            current_guard_reasons=[],
+        )
+
+        decide_call = pipeline.decision_engine.decide.call_args
+        assert decide_call is not None, "decision_engine.decide was not called"
+        llm_context = decide_call.args[1]
+
+        assert llm_context["ledger_summary"]["cuotas_paid"] == 3
+        assert llm_context["ledger_summary"]["next_expected_cuota"] == 4
+        assert llm_context["ledger_summary"]["protected_payment_ids"] == []
+        assert llm_context["sequence_integrity"]["trusted"] is True
+        assert llm_context["allocator_diagnostics"]["next_expected_cuota_from_ledger"] == 4
+        assert len(llm_context["existing_sheet_rows"]) == 4
