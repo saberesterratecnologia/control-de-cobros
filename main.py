@@ -53,7 +53,6 @@ def load_config(path: str) -> dict[str, Any]:
 @click.option("--commission", default=None, help="Filter by commission name")
 @click.option("--year", default=None, type=int, help="Year to process (default: from config)")
 @click.option("--org", default=None, type=int, help="Organization ID to process (default: from config, usually 2)")
-@click.option("--skip-write-back", is_flag=True, help="Do not persist conciliation SQL updates")
 @click.option("--export-reviews", is_flag=True, help="Only export pending reviews to REVISIONES")
 @click.option("--sync-reviews", is_flag=True, help="Only sync resolved reviews from REVISIONES")
 @click.option("--rollback", "rollback_run_id", default=None, help="Rollback a previous live run by run_id")
@@ -66,7 +65,6 @@ def main(
     commission: str | None,
     year: int | None,
     org: int | None,
-    skip_write_back: bool,
     export_reviews: bool,
     sync_reviews: bool,
     rollback_run_id: str | None,
@@ -83,7 +81,6 @@ def main(
         if org is not None:
             config.setdefault("agent", {})["id_organizacion"] = org
         config.setdefault("agent", {})["dry_run"] = dry_run
-        config.setdefault("agent", {})["skip_write_back"] = skip_write_back
 
         logger = StructuredLogger("conciliation", log_file=config.get("logging", {}).get("file"))
         logger.log_run_start(config)

@@ -35,7 +35,6 @@ def sample_config(tmp_path: Path) -> dict:
             "dry_run": True,
             "id_organizacion": 2,
             "year": 2026,
-            "skip_write_back": False,
             "batch_size": 20,
             "checkpoint_interval": 20,
             "max_pending_review": 100,

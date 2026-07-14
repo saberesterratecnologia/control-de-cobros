@@ -46,18 +46,8 @@ def test_pipeline_runs_dry_run_mode(sample_config, sample_commission, sample_stu
     monkeypatch.setattr(pipeline.sql, "get_students", lambda _id: [sample_student])
     monkeypatch.setattr(
         pipeline.sql,
-        "get_all_payments",
-        lambda _id, year=None, id_organizacion=None: [],
-    )
-    monkeypatch.setattr(
-        pipeline.sql,
         "get_conciliated_payments",
         lambda _id, year=None, id_organizacion=None: [],
-    )
-    monkeypatch.setattr(
-        pipeline.sql,
-        "get_available_movements",
-        lambda _id, year=None: [],
     )
     monkeypatch.setattr(
         pipeline.sql,
@@ -156,7 +146,6 @@ def test_pipeline_generates_summary(sample_config):
     summary = pipeline._generate_summary("run-1")
     assert summary["run_id"] == "run-1"
     assert "discrepancies_total" in summary
-    assert "payments_conciliated" in summary
     assert "cobros_blocked" in summary
 
 
@@ -207,48 +196,6 @@ def test_pipeline_handles_connection_errors(sample_config, monkeypatch):
 
     with pytest.raises(RuntimeError):
         pipeline.run(dry_run=True)
-
-
-def test_inline_conciliation_updates_payment_in_dry_run(sample_config):
-    pipeline = ConciliationPipeline(sample_config)
-    pipeline._run_id = "run-1"
-
-    payment = Payment(
-        id_pago_mp=101,
-        fecha=datetime(2026, 5, 10, 12, 0, 0),
-        monto=Decimal("15000.00"),
-        nro_operacion="REF-101",
-        id_persona=10,
-        id_medio_pago=2,
-        fecha_carga=None,
-        controlado=False,
-        comentario_cliente=None,
-        id_concepto_pago=2,
-        id_movimiento_bancario=-1,
-        id_organizacion=2,
-        razon_social_originante=None,
-        dni_cuit_originante=None,
-        controlado_auto=False,
-        estado_conciliacion_auto="pendiente",
-    )
-    movement = BankMovement(
-        id_movimiento=202,
-        id_cuenta_bancaria=1,
-        id_persona=10,
-        fecha=date(2026, 5, 10),
-        referencia="REF-101",
-        causal=None,
-        concepto=None,
-        importe=Decimal("15000.00"),
-        conciliado=False,
-    )
-
-    updated = pipeline._try_persist_conciliation(
-        [payment], [movement], dry_run=True,
-    )
-
-    assert pipeline._counters.payments_conciliated == 1
-    assert updated[0].id_movimiento_bancario == movement.id_movimiento
 
 
 # ===================================================================
@@ -347,3 +294,355 @@ class TestDetectInvalidSheetSequenceRelaxed:
         ]
         reasons = pipeline._detect_invalid_sheet_sequence(sample_commission, rows)
         assert reasons == []
+
+
+# ===================================================================
+# Phase 0 removal — RED tests (must fail before implementation)
+# ===================================================================
+
+
+def test_process_student_uses_only_conciliated_payments(
+    sample_config, sample_commission, sample_student, sample_payment, sample_movement, monkeypatch,
+):
+    """_process_student must use ONLY get_conciliated_payments as data source.
+
+    After removal, get_all_payments and get_available_movements must NOT be
+    called, and ConciliatedPayment objects must have conciliated_by='existing'.
+    """
+    pipeline = ConciliationPipeline(sample_config)
+    pipeline._run_id = "run-1"
+
+    monkeypatch.setattr(pipeline.context, "save_pending_review", lambda **_: 1)
+    monkeypatch.setattr(pipeline.context, "save_checkpoint", lambda **_: 1)
+    monkeypatch.setattr(pipeline.context, "save_discrepancy", lambda *_: 1)
+    monkeypatch.setattr(pipeline.context, "is_already_applied", lambda *_: False)
+
+    conciliated_pairs = [(sample_payment, sample_movement)]
+    monkeypatch.setattr(
+        pipeline.sql, "get_conciliated_payments",
+        lambda _id, year=None, id_organizacion=None: conciliated_pairs,
+    )
+    monkeypatch.setattr(
+        pipeline.sql, "get_active_commissions_for_student",
+        lambda _id, year, id_organizacion=2: [sample_commission],
+    )
+
+    from src.models.pipeline import LLMDecision
+    monkeypatch.setattr(
+        pipeline.decision_engine, "decide",
+        lambda disc, ctx: LLMDecision(
+            discrepancy_id=disc.id, action="skip", reasoning="mocked",
+            confidence=0.5, suggested_value=None, model_used="mock",
+        ),
+    )
+
+    with pipeline.context:
+        pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
+
+    # get_all_payments and get_available_movements no longer exist on the connector,
+    # so they cannot possibly be called — the absence of these methods IS the proof.
+    assert not hasattr(pipeline.sql, "get_available_movements")
+    assert not hasattr(pipeline.sql, "get_unconciliated_payments")
+
+
+def test_generate_summary_has_no_phase0_keys(sample_config):
+    """Summary must NOT contain payments_conciliated or payments_pending."""
+    pipeline = ConciliationPipeline(sample_config)
+    summary = pipeline._generate_summary("run-1")
+    assert "payments_conciliated" not in summary
+    assert "payments_pending" not in summary
+
+
+def test_uncontrolled_flagging_from_conciliated_pairs(
+    sample_config, sample_commission, sample_student, sample_movement, monkeypatch,
+):
+    """pago_no_controlado reviews must come from conciliated pairs, not get_all_payments."""
+    pipeline = ConciliationPipeline(sample_config)
+    pipeline._run_id = "run-1"
+
+    uncontrolled_payment = Payment(
+        id_pago_mp=999,
+        fecha=datetime(2026, 1, 10, 10, 0, 0),
+        monto=Decimal("10000"),
+        nro_operacion="OP-999",
+        id_persona=1,
+        id_medio_pago=2,
+        fecha_carga=None,
+        controlado=False,
+        comentario_cliente=None,
+        id_concepto_pago=1,
+        id_movimiento_bancario=201,
+        razon_social_originante=None,
+        dni_cuit_originante=None,
+        controlado_auto=False,
+        estado_conciliacion_auto=None,
+    )
+
+    saved_reviews = []
+
+    def _save_review(**kwargs):
+        saved_reviews.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(pipeline.context, "save_pending_review", _save_review)
+    monkeypatch.setattr(pipeline.context, "save_checkpoint", lambda **_: 1)
+    monkeypatch.setattr(pipeline.context, "save_discrepancy", lambda *_: 1)
+    monkeypatch.setattr(pipeline.context, "is_already_applied", lambda *_: False)
+
+    monkeypatch.setattr(
+        pipeline.sql, "get_conciliated_payments",
+        lambda _id, year=None, id_organizacion=None: [(uncontrolled_payment, sample_movement)],
+    )
+    monkeypatch.setattr(
+        pipeline.sql, "get_active_commissions_for_student",
+        lambda _id, year, id_organizacion=2: [sample_commission],
+    )
+
+    from src.models.pipeline import LLMDecision
+    monkeypatch.setattr(
+        pipeline.decision_engine, "decide",
+        lambda disc, ctx: LLMDecision(
+            discrepancy_id=disc.id, action="skip", reasoning="mocked",
+            confidence=0.5, suggested_value=None, model_used="mock",
+        ),
+    )
+
+    with pipeline.context:
+        pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
+
+    pago_reviews = [r for r in saved_reviews if r.get("reason") == "pago_no_controlado"]
+    assert len(pago_reviews) == 1, "Uncontrolled payment from conciliated pair must generate review"
+    assert pago_reviews[0]["context_json"]["payment_id"] == 999
+
+
+# ===================================================================
+# _evaluate_stale_reviews — stale review auto-close evaluator
+# ===================================================================
+
+import json
+from pathlib import Path
+from src.context.context_manager import ContextManager
+
+
+def _schema_path() -> str:
+    return str(Path(__file__).resolve().parents[2] / "src" / "context" / "schema.sql")
+
+
+class TestEvaluateStaleReviews:
+    """Unit tests for _evaluate_stale_reviews pipeline method."""
+
+    def _make_pipeline_with_context(self, sample_config):
+        """Create a pipeline with a real in-memory ContextManager."""
+        pipeline = ConciliationPipeline(sample_config)
+        pipeline.context = ContextManager(":memory:", schema_path=_schema_path())
+        return pipeline
+
+    def test_closes_guard_review_when_reasons_no_longer_match(self, sample_config, sample_commission):
+        """Guard review whose reasons have NO overlap with current → closed."""
+        pipeline = self._make_pipeline_with_context(sample_config)
+        with pipeline.context:
+            run_id = pipeline.context.start_run()
+            pipeline._run_id = run_id
+            review_id = pipeline.context.save_pending_review(
+                run_id, None, "guard:invalid_sequence",
+                {"commission": "Comisión A", "dni": "30111222", "reasons": ["missing_inscription_with_existing_cuotas"]},
+            )
+
+            pipeline._evaluate_stale_reviews(
+                commission=sample_commission,
+                student_dni="30111222",
+                actual_rows=[],
+                current_guard_reasons=[],  # no guard reasons anymore
+                current_anomalies=set(),
+            )
+
+            row = pipeline.context._require_connection().execute(
+                "SELECT status, reviewer_notes FROM pending_reviews WHERE id = ?", (review_id,)
+            ).fetchone()
+            assert dict(row)["status"] == "resolved"
+            assert dict(row)["reviewer_notes"] == "auto_close:guard_resolved"
+
+    def test_keeps_guard_review_open_when_reasons_still_overlap(self, sample_config, sample_commission):
+        """Guard review whose reasons still overlap with current → stays open."""
+        pipeline = self._make_pipeline_with_context(sample_config)
+        with pipeline.context:
+            run_id = pipeline.context.start_run()
+            pipeline._run_id = run_id
+            review_id = pipeline.context.save_pending_review(
+                run_id, None, "guard:invalid_sequence",
+                {"commission": "Comisión A", "dni": "30111222", "reasons": ["missing_inscription_with_existing_cuotas"]},
+            )
+
+            pipeline._evaluate_stale_reviews(
+                commission=sample_commission,
+                student_dni="30111222",
+                actual_rows=[],
+                current_guard_reasons=["missing_inscription_with_existing_cuotas"],
+                current_anomalies=set(),
+            )
+
+            row = pipeline.context._require_connection().execute(
+                "SELECT status FROM pending_reviews WHERE id = ?", (review_id,)
+            ).fetchone()
+            assert dict(row)["status"] == "open"
+
+    def test_closes_anomaly_review_when_type_absent(self, sample_config, sample_commission):
+        """Anomaly review whose type is absent from current_anomalies → closed."""
+        pipeline = self._make_pipeline_with_context(sample_config)
+        with pipeline.context:
+            run_id = pipeline.context.start_run()
+            pipeline._run_id = run_id
+            review_id = pipeline.context.save_pending_review(
+                run_id, None, "anomaly:cobro_no_aplica",
+                {"row_number": 5},
+            )
+
+            pipeline._evaluate_stale_reviews(
+                commission=sample_commission,
+                student_dni="30111222",
+                actual_rows=[_make_venta_row("Cuota 1", Decimal("5000"), row_number=5)],
+                current_guard_reasons=[],
+                current_anomalies=set(),  # cobro_no_aplica no longer present
+            )
+
+            row = pipeline.context._require_connection().execute(
+                "SELECT status, reviewer_notes FROM pending_reviews WHERE id = ?", (review_id,)
+            ).fetchone()
+            assert dict(row)["status"] == "resolved"
+            assert dict(row)["reviewer_notes"] == "auto_close:anomaly_resolved"
+
+    def test_keeps_anomaly_review_open_when_type_still_present(self, sample_config, sample_commission):
+        """Anomaly review whose type is still in current_anomalies → stays open."""
+        pipeline = self._make_pipeline_with_context(sample_config)
+        with pipeline.context:
+            run_id = pipeline.context.start_run()
+            pipeline._run_id = run_id
+            review_id = pipeline.context.save_pending_review(
+                run_id, None, "anomaly:cobro_no_aplica",
+                {"row_number": 5},
+            )
+
+            pipeline._evaluate_stale_reviews(
+                commission=sample_commission,
+                student_dni="30111222",
+                actual_rows=[_make_venta_row("Cuota 1", Decimal("5000"), row_number=5)],
+                current_guard_reasons=[],
+                current_anomalies={"cobro_no_aplica"},  # still present
+            )
+
+            row = pipeline.context._require_connection().execute(
+                "SELECT status FROM pending_reviews WHERE id = ?", (review_id,)
+            ).fetchone()
+            assert dict(row)["status"] == "open"
+
+    def test_ignores_ambiguous_and_pago_no_controlado_reviews(self, sample_config, sample_commission):
+        """Ambiguous and pago_no_controlado reviews must remain untouched."""
+        pipeline = self._make_pipeline_with_context(sample_config)
+        with pipeline.context:
+            run_id = pipeline.context.start_run()
+            pipeline._run_id = run_id
+            amb_id = pipeline.context.save_pending_review(
+                run_id, None, "ambiguous_allocation:auto",
+                {"commission": "Comisión A", "dni": "30111222", "payment_id": 1},
+            )
+            pnc_id = pipeline.context.save_pending_review(
+                run_id, None, "pago_no_controlado",
+                {"commission": "Comisión A", "dni": "30111222", "payment_id": 2},
+            )
+
+            pipeline._evaluate_stale_reviews(
+                commission=sample_commission,
+                student_dni="30111222",
+                actual_rows=[],
+                current_guard_reasons=[],
+                current_anomalies=set(),
+            )
+
+            conn = pipeline.context._require_connection()
+            for rid in (amb_id, pnc_id):
+                row = conn.execute("SELECT status FROM pending_reviews WHERE id = ?", (rid,)).fetchone()
+                assert dict(row)["status"] == "open"
+
+
+class TestProcessStudentStaleReviewHook:
+    """Verify _process_student() calls _evaluate_stale_reviews at the right point."""
+
+    def test_calls_evaluate_stale_reviews_after_guard_detection(
+        self, sample_config, sample_commission, sample_student, sample_movement, monkeypatch,
+    ):
+        """_process_student must call _evaluate_stale_reviews after guard detection."""
+        pipeline = ConciliationPipeline(sample_config)
+        pipeline._run_id = "run-1"
+
+        monkeypatch.setattr(pipeline.context, "save_pending_review", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_checkpoint", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_discrepancy", lambda *_: 1)
+        monkeypatch.setattr(pipeline.context, "is_already_applied", lambda *_: False)
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [],
+        )
+        monkeypatch.setattr(
+            pipeline.sql, "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+        from src.models.pipeline import LLMDecision
+        monkeypatch.setattr(
+            pipeline.decision_engine, "decide",
+            lambda disc, ctx: LLMDecision(
+                discrepancy_id=disc.id, action="skip", reasoning="mocked",
+                confidence=0.5, suggested_value=None, model_used="mock",
+            ),
+        )
+
+        call_log: list[str] = []
+        original_evaluate = pipeline._evaluate_stale_reviews
+
+        def _tracking_evaluate(*args, **kwargs):
+            call_log.append("evaluate_stale_reviews")
+            return original_evaluate(*args, **kwargs)
+
+        monkeypatch.setattr(pipeline, "_evaluate_stale_reviews", _tracking_evaluate)
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
+
+        assert "evaluate_stale_reviews" in call_log
+
+    def test_noop_when_no_open_reviews(
+        self, sample_config, sample_commission, sample_student, monkeypatch,
+    ):
+        """Student with no open reviews: _evaluate_stale_reviews produces no close_review calls."""
+        pipeline = ConciliationPipeline(sample_config)
+        pipeline._run_id = "run-1"
+
+        monkeypatch.setattr(pipeline.context, "save_pending_review", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_checkpoint", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_discrepancy", lambda *_: 1)
+        monkeypatch.setattr(pipeline.context, "is_already_applied", lambda *_: False)
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [],
+        )
+        monkeypatch.setattr(
+            pipeline.sql, "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+        from src.models.pipeline import LLMDecision
+        monkeypatch.setattr(
+            pipeline.decision_engine, "decide",
+            lambda disc, ctx: LLMDecision(
+                discrepancy_id=disc.id, action="skip", reasoning="mocked",
+                confidence=0.5, suggested_value=None, model_used="mock",
+            ),
+        )
+
+        close_calls: list[tuple] = []
+        monkeypatch.setattr(pipeline.context, "close_review", lambda rid, reason: close_calls.append((rid, reason)))
+        monkeypatch.setattr(pipeline.context, "get_open_reviews_for_student", lambda c, d: [])
+        monkeypatch.setattr(pipeline.context, "get_open_anomaly_reviews_for_rows", lambda rn: [])
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
+
+        assert close_calls == []

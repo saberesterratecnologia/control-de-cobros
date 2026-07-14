@@ -148,6 +148,7 @@ class SQLServerConnector:
                 c.valor_inscripcion_promocion,
                 c.valor_cuota,
                 c.valor_cuota_bonificada,
+                c.valor_pago_unico,
                 c.cantidad_cuotas,
                 c.duracion_meses,
                 c.fecha_inicio,
@@ -169,6 +170,7 @@ class SQLServerConnector:
             "valor_inscripcion_promocion",
             "valor_cuota",
             "valor_cuota_bonificada",
+            "valor_pago_unico",
             "cantidad_cuotas",
             "duracion_meses",
             "fecha_inicio",
@@ -189,6 +191,7 @@ class SQLServerConnector:
                 c.valor_inscripcion_promocion,
                 c.valor_cuota,
                 c.valor_cuota_bonificada,
+                c.valor_pago_unico,
                 c.cantidad_cuotas,
                 c.duracion_meses,
                 c.fecha_inicio,
@@ -212,6 +215,7 @@ class SQLServerConnector:
             "valor_inscripcion_promocion",
             "valor_cuota",
             "valor_cuota_bonificada",
+            "valor_pago_unico",
             "cantidad_cuotas",
             "duracion_meses",
             "fecha_inicio",
@@ -279,6 +283,7 @@ class SQLServerConnector:
                 c.valor_inscripcion_promocion,
                 c.valor_cuota,
                 c.valor_cuota_bonificada,
+                c.valor_pago_unico,
                 c.cantidad_cuotas,
                 c.duracion_meses,
                 c.fecha_inicio,
@@ -305,6 +310,7 @@ class SQLServerConnector:
             "valor_inscripcion_promocion",
             "valor_cuota",
             "valor_cuota_bonificada",
+            "valor_pago_unico",
             "cantidad_cuotas",
             "duracion_meses",
             "fecha_inicio",
@@ -360,33 +366,6 @@ class SQLServerConnector:
     ) -> list[Payment]:
         """Get all payments for a person, including conciliated and unconciliated."""
         return self.get_payments(id_persona, year=year, id_organizacion=id_organizacion)
-
-    def get_available_movements(self, id_persona: int, year: int | None = None) -> list[BankMovement]:
-        """Get bank movements for a person that are not yet conciliated."""
-        query = """
-            SELECT
-                m.id_movimiento,
-                m.id_cuenta_bancaria,
-                m.id_persona,
-                m.fecha,
-                m.referencia,
-                m.causal,
-                m.concepto,
-                m.importe,
-                m.conciliado,
-                m.json_identificacion
-            FROM MOVIMIENTO_BANCARIO m
-            WHERE m.id_persona = ?
-              AND m.conciliado = 0
-        """
-        params: list[Any] = [id_persona]
-        if year is not None:
-            query += "\n              AND YEAR(m.fecha) = ?"
-            params.append(year)
-        query += "\n            ORDER BY m.fecha DESC"
-        cursor = self._cursor()
-        rows = cursor.execute(query, tuple(params)).fetchall()
-        return [self._movement_from_row(row) for row in rows]
 
     def get_conciliated_payments(
         self,
@@ -464,165 +443,6 @@ class SQLServerConnector:
         if row is None:
             return None
         return self._movement_from_row(row)
-
-    def get_unconciliated_payments(
-        self,
-        year: int | None = None,
-        id_organizacion: int | None = None,
-    ) -> list[Payment]:
-        query = """
-            SELECT
-                p.id_pago_mp,
-                p.fecha,
-                p.monto,
-                p.nro_operacion,
-                p.id_persona,
-                p.id_medio_pago,
-                p.fecha_carga,
-                p.controlado,
-                p.comentario_cliente,
-                p.id_concepto_pago,
-                p.id_movimiento_bancario,
-                p.id_organizacion,
-                p.razon_social_originante,
-                p.dni_cuit_originante,
-                p.controlado_auto,
-                p.estado_conciliacion_auto
-            FROM PAGO_MERCADO_PAGO p
-            WHERE p.id_persona IS NOT NULL
-              AND (p.id_movimiento_bancario IS NULL OR p.id_movimiento_bancario <= 0)
-        """
-        params: list[Any] = []
-        if year is not None:
-            query += "\n              AND YEAR(p.fecha) = ?"
-            params.append(year)
-        if id_organizacion is not None:
-            query += "\n              AND (p.id_organizacion = ? OR p.id_organizacion IS NULL)"
-            params.append(id_organizacion)
-        query += "\n            ORDER BY p.fecha DESC, p.id_pago_mp DESC"
-        cursor = self._cursor()
-        rows = cursor.execute(query, tuple(params)).fetchall()
-        return [self._payment_from_row(row) for row in rows]
-
-    def update_payment_conciliation(
-        self,
-        id_pago_mp: int,
-        id_movimiento_bancario: int,
-        *,
-        commit: bool = True,
-    ) -> bool:
-        cursor = self._cursor()
-        cursor.execute(
-            "SELECT id_movimiento_bancario FROM PAGO_MERCADO_PAGO WHERE id_pago_mp = ?",
-            (id_pago_mp,),
-        )
-        current = cursor.fetchone()
-        if current is None:
-            raise ConnectorError(f"Payment {id_pago_mp} not found")
-
-        if current[0] == id_movimiento_bancario:
-            return False
-        if current[0] is not None and current[0] > 0 and current[0] != id_movimiento_bancario:
-            raise ConnectorError(
-                f"Payment {id_pago_mp} already conciliated with movement {current[0]}"
-            )
-
-        cursor.execute(
-            "UPDATE PAGO_MERCADO_PAGO SET id_movimiento_bancario = ? WHERE id_pago_mp = ?",
-            (id_movimiento_bancario, id_pago_mp),
-        )
-        if commit and self.connection is not None:
-            self.connection.commit()
-        return True
-
-    def mark_movement_conciliated(
-        self,
-        id_movimiento: int,
-        conciliado: bool = True,
-        *,
-        commit: bool = True,
-    ) -> bool:
-        cursor = self._cursor()
-        cursor.execute(
-            "SELECT conciliado FROM MOVIMIENTO_BANCARIO WHERE id_movimiento = ?",
-            (id_movimiento,),
-        )
-        current = cursor.fetchone()
-        if current is None:
-            raise ConnectorError(f"Bank movement {id_movimiento} not found")
-
-        if bool(current[0]) == conciliado:
-            return False
-
-        cursor.execute(
-            "UPDATE MOVIMIENTO_BANCARIO SET conciliado = ? WHERE id_movimiento = ?",
-            (1 if conciliado else 0, id_movimiento),
-        )
-        if commit and self.connection is not None:
-            self.connection.commit()
-        return True
-
-    def persist_payment_movement_conciliation(
-        self,
-        id_pago_mp: int,
-        id_movimiento_bancario: int,
-    ) -> str:
-        cursor = self._cursor()
-
-        cursor.execute(
-            "SELECT id_movimiento_bancario FROM PAGO_MERCADO_PAGO WHERE id_pago_mp = ?",
-            (id_pago_mp,),
-        )
-        payment_row = cursor.fetchone()
-        if payment_row is None:
-            raise ConnectorError(f"Payment {id_pago_mp} not found")
-
-        cursor.execute(
-            "SELECT conciliado FROM MOVIMIENTO_BANCARIO WHERE id_movimiento = ?",
-            (id_movimiento_bancario,),
-        )
-        movement_row = cursor.fetchone()
-        if movement_row is None:
-            raise ConnectorError(f"Bank movement {id_movimiento_bancario} not found")
-
-        cursor.execute(
-            "SELECT TOP 1 id_pago_mp FROM PAGO_MERCADO_PAGO "
-            "WHERE id_movimiento_bancario = ? AND id_pago_mp <> ?",
-            (id_movimiento_bancario, id_pago_mp),
-        )
-        linked_payment = cursor.fetchone()
-
-        current_payment_movement = payment_row[0]
-        current_movement_conciliated = bool(movement_row[0])
-
-        if linked_payment is not None:
-            return "conflict"
-        if current_payment_movement == id_movimiento_bancario and current_movement_conciliated:
-            return "skipped"
-        if current_payment_movement is not None and current_payment_movement > 0:
-            return "conflict"
-        if current_movement_conciliated:
-            return "conflict"
-
-        try:
-            self.update_payment_conciliation(
-                id_pago_mp,
-                id_movimiento_bancario,
-                commit=False,
-            )
-            self.mark_movement_conciliated(
-                id_movimiento_bancario,
-                conciliado=True,
-                commit=False,
-            )
-        except Exception:
-            if self.connection is not None:
-                self.connection.rollback()
-            raise
-
-        if self.connection is not None:
-            self.connection.commit()
-        return "updated"
 
     def get_payment_concepts(self) -> list[PaymentConcept]:
         query = """

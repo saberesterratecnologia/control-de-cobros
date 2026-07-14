@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -29,7 +30,6 @@ from src.models.pipeline import (
 from src.models.sheet import ExpectedRow, SheetRow
 from src.models.source import BankMovement, Commission, Payment, Student
 from src.rules.allocation_engine import AllocationEngine
-from src.rules.conciliator import Conciliator
 from src.rules.mappers import map_cobro_medio, map_estado_administrativo, map_medio
 from src.rules.normalizer import SheetNormalizer
 from src.reviews.review_manager import ReviewManager
@@ -39,8 +39,6 @@ from src.writer.sheet_writer import SheetWriter
 
 @dataclass
 class _RunCounters:
-    payments_conciliated: int = 0
-    payments_pending: int = 0
     cobros_blocked: int = 0
     commissions_processed: int = 0
     students_processed: int = 0
@@ -59,7 +57,6 @@ class ConciliationPipeline:
         self.sql = SQLServerConnector(config["database"])
         self.sheets = SheetsConnector(config["sheets"])
         self.normalizer = SheetNormalizer()
-        self.conciliator = Conciliator()
         self.reconciler = SheetReconciler()
         self._discrepancy_ids = count(1)
         self.scorer = ConfidenceScorer()
@@ -209,71 +206,6 @@ class ConciliationPipeline:
         for key, value in source.get("by_status", {}).items():
             target["by_status"][key] = target["by_status"].get(key, 0) + value
 
-    def _try_persist_conciliation(
-        self,
-        all_payments: list[Payment],
-        available_movements: list[BankMovement],
-        *,
-        dry_run: bool = True,
-    ) -> list[Payment]:
-        """Try to conciliate unconciliated payments with available movements.
-
-        For each unconciliated payment, uses the conciliator to find a match.
-        In live mode, persists the conciliation to SQL Server.
-        Returns the updated payment list with conciliated id_movimiento_bancario set.
-        """
-        write_enabled = not dry_run and not bool(
-            self.config.get("agent", {}).get("skip_write_back", False)
-        )
-
-        matches = self.conciliator.build_persistable_matches(all_payments, available_movements)
-        updated_payments: list[Payment] = []
-
-        for match in matches:
-            if match.status == "existing":
-                updated_payments.append(match.payment)
-                continue
-
-            if match.status != "matched" or match.movement is None:
-                self._counters.payments_pending += 1
-                updated_payments.append(match.payment)
-                continue
-
-            if write_enabled:
-                try:
-                    status = self.sql.persist_payment_movement_conciliation(
-                        match.payment.id_pago_mp,
-                        match.movement.id_movimiento,
-                    )
-                except Exception as error:  # noqa: BLE001
-                    LOGGER.warning(
-                        "Conciliation write failed for payment %s: %s",
-                        match.payment.id_pago_mp,
-                        error,
-                    )
-                    self._counters.errors += 1
-                    self._counters.payments_pending += 1
-                    updated_payments.append(match.payment)
-                    continue
-
-                if status == "conflict":
-                    LOGGER.warning(
-                        "Conciliation conflict for payment %s → movement %s",
-                        match.payment.id_pago_mp,
-                        match.movement.id_movimiento,
-                    )
-                    self._counters.payments_pending += 1
-                    updated_payments.append(match.payment)
-                    continue
-
-            linked_payment = match.payment.model_copy(
-                update={"id_movimiento_bancario": match.movement.id_movimiento}
-            )
-            updated_payments.append(linked_payment)
-            self._counters.payments_conciliated += 1
-
-        return updated_payments
-
     def _process_commission(self, commission: Commission, sheet_rows: list[SheetRow], dry_run: bool = True, force_reprocess: bool = False) -> list[Discrepancy]:
         discrepancies: list[Discrepancy] = []
         students = self.sql.get_students(commission.id_comision)
@@ -323,21 +255,17 @@ class ConciliationPipeline:
 
         allocator = AllocationEngine(commission)
         payment_year = commission.fecha_inicio.year if commission.fecha_inicio else int(self.config["agent"]["year"])
-        all_payments = self.sql.get_all_payments(
-            student.id_persona,
-            year=payment_year,
-            id_organizacion=commission.id_organizacion,
-        )
+
+        # SOLE data source: pre-conciliated pairs
         conciliated_pairs = self.sql.get_conciliated_payments(
             student.id_persona,
             year=payment_year,
             id_organizacion=commission.id_organizacion,
         )
-        available_movements = self.sql.get_available_movements(student.id_persona, year=payment_year)
 
-        # --- Flag uncontrolled payments for human review ---
+        # --- Flag uncontrolled payments from conciliated set ---
         assert self._run_id is not None
-        for payment in all_payments:
+        for payment, _movement in conciliated_pairs:
             if not payment.controlado:
                 self._counters.pending_review += 1
                 self.context.save_pending_review(
@@ -355,24 +283,14 @@ class ConciliationPipeline:
                     },
                 )
 
-        # --- Inline conciliation: try to conciliate unconciliated payments ---
-        movements_by_id = {m.id_movimiento: m for m in available_movements}
-        all_payments = self._try_persist_conciliation(
-            all_payments, available_movements, dry_run=dry_run,
-        )
-
-        conciliated = self.conciliator.build_conciliated_list(all_payments, available_movements)
-        pairs_by_payment_id = {payment.id_pago_mp: movement for payment, movement in conciliated_pairs}
-        # Enrich from DB conciliated pairs first, then from available movements for inline matches
-        for cp in conciliated:
-            if cp.conciliated_by == "existing" and cp.movement is None:
-                mov_id = cp.payment.id_movimiento_bancario
-                if mov_id and mov_id > 0 and cp.payment.id_pago_mp not in pairs_by_payment_id:
-                    movement = movements_by_id.get(mov_id)
-                    if movement is not None:
-                        pairs_by_payment_id[cp.payment.id_pago_mp] = movement
-        enriched_conciliated = [self._enrich_existing_movement(cp, pairs_by_payment_id) for cp in conciliated]
+        # Build ConciliatedPayment directly — no matching, no enrichment
+        enriched_conciliated = [
+            ConciliatedPayment(payment=p, movement=m, conciliated_by="existing")
+            for p, m in conciliated_pairs
+        ]
         enriched_conciliated = [self._ensure_student_dni(cp, student.dni) for cp in enriched_conciliated]
+
+        all_payments = [cp.payment for cp in enriched_conciliated]
 
         actual_rows = [
             row
@@ -408,6 +326,35 @@ class ConciliationPipeline:
                     },
                 )
                 return [], []
+
+        # --- Evaluate stale reviews (after guard detection, before allocation) ---
+        # Determine current guard state: when force_reprocess is True, guard
+        # detection above was skipped, so re-detect now for stale evaluation.
+        if force_reprocess:
+            current_guard_reasons = self._detect_invalid_sheet_sequence(commission, actual_rows)
+        else:
+            # invalid_reasons was computed above; it's [] when no guard fired.
+            current_guard_reasons = invalid_reasons
+
+        # Build current anomaly set from the student's rows
+        student_anomalies: set[str] = set()
+        for row in actual_rows:
+            if row.tipo_movimiento == "Cobro" and row.medio_pago == "No aplica":
+                student_anomalies.add("cobro_no_aplica")
+            if row.tipo_movimiento == "Venta" and row.id_movimiento_bancario is not None:
+                student_anomalies.add("venta_with_movement")
+            if row.tipo_movimiento == "Cobro" and not (row.medio_pago or "").strip():
+                student_anomalies.add("missing_medio")
+            if row.monto <= 0:
+                student_anomalies.add("negative_monto")
+
+        self._evaluate_stale_reviews(
+            commission=commission,
+            student_dni=student.dni,
+            actual_rows=actual_rows,
+            current_guard_reasons=current_guard_reasons,
+            current_anomalies=student_anomalies,
+        )
 
         # --- Exclude payments already assigned to OTHER commissions ---
         # If this student is in multiple commissions, a payment that is
@@ -801,16 +748,6 @@ class ConciliationPipeline:
                 discrepancy_id=f"orphan-{row.row_number}",
             )
 
-    def _enrich_existing_movement(self, conciliated_payment, pairs_by_payment_id):
-        if conciliated_payment.conciliated_by != "existing" or conciliated_payment.movement is not None:
-            return conciliated_payment
-
-        payment_id = conciliated_payment.payment.id_pago_mp
-        movement = pairs_by_payment_id.get(payment_id)
-        if movement is None:
-            return conciliated_payment
-        return conciliated_payment.model_copy(update={"movement": movement})
-
     @staticmethod
     def _ensure_student_dni(conciliated_payment, student_dni: str):
         payment = conciliated_payment.payment
@@ -1029,6 +966,12 @@ class ConciliationPipeline:
                 )]
 
         self._counters.pending_review += 1
+        commission_prices = {
+            "inscripcion": str(commission.valor_inscripcion_promocion or commission.valor_inscripcion or ""),
+            "cuota": str(commission.valor_cuota_bonificada or commission.valor_cuota or ""),
+            "cantidad_cuotas": commission.cantidad_cuotas,
+            "pago_unico": str(commission.valor_pago_unico) if commission.valor_pago_unico else None,
+        }
         self.context.save_pending_review(
             run_id=self._run_id,
             discrepancy_id=None,
@@ -1041,6 +984,7 @@ class ConciliationPipeline:
                 "fecha": ambiguous.payment.payment.fecha.date().isoformat() if ambiguous.payment.payment.fecha else None,
                 "decision": decision.model_dump(mode="json"),
                 "candidates": [candidate.model_dump(mode="json") for candidate in ambiguous.candidates],
+                "commission_prices": commission_prices,
             },
         )
         return []
@@ -1290,11 +1234,51 @@ class ConciliationPipeline:
             ]
         return context
 
+    def _evaluate_stale_reviews(
+        self,
+        commission: Commission,
+        student_dni: str,
+        actual_rows: list[SheetRow],
+        current_guard_reasons: list[str],
+        current_anomalies: set[str],
+    ) -> None:
+        """Auto-close stale guard and anomaly reviews for this student.
+
+        Called per-student inside _process_student() after guard and anomaly
+        detection but before new review creation.
+        """
+        commission_name = commission.nombre.strip()
+        dni = student_dni.strip()
+
+        # --- Guard reviews ---
+        guard_reviews = self.context.get_open_reviews_for_student(commission_name, dni)
+        current_guard_set = set(current_guard_reasons)
+        for review in guard_reviews:
+            ctx = json.loads(review.get("context_json") or "{}")
+            review_reasons = set(ctx.get("reasons", []))
+            if not review_reasons & current_guard_set:
+                self.context.close_review(review["id"], "auto_close:guard_resolved")
+                LOGGER.info(
+                    "auto-closed stale guard review id=%s for %s DNI=%s",
+                    review["id"], commission_name, dni,
+                )
+
+        # --- Anomaly reviews ---
+        student_row_numbers = [r.row_number for r in actual_rows]
+        anomaly_reviews = self.context.get_open_anomaly_reviews_for_rows(student_row_numbers)
+        for review in anomaly_reviews:
+            reason = review.get("reason", "")
+            anomaly_type = reason.split(":", 1)[1] if ":" in reason else reason
+            if anomaly_type not in current_anomalies:
+                self.context.close_review(review["id"], "auto_close:anomaly_resolved")
+                LOGGER.info(
+                    "auto-closed stale anomaly review id=%s type=%s",
+                    review["id"], anomaly_type,
+                )
+
     def _generate_summary(self, run_id: str | None) -> dict[str, Any]:
         return {
             "run_id": run_id,
-            "payments_conciliated": self._counters.payments_conciliated,
-            "payments_pending": self._counters.payments_pending,
             "cobros_blocked": self._counters.cobros_blocked,
             "commissions_processed": self._counters.commissions_processed,
             "students_processed": self._counters.students_processed,
@@ -1515,6 +1499,8 @@ class ConciliationPipeline:
             if commission.valor_cuota:
                 candidates.append(commission.valor_cuota)
         elif "pago único" in concept_lower or "pago unico" in concept_lower:
+            if commission.valor_pago_unico:
+                candidates.append(commission.valor_pago_unico)
             cuota = commission.valor_cuota_bonificada or commission.valor_cuota
             cant = commission.cantidad_cuotas or 0
             if cuota and cant > 0:

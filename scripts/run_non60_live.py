@@ -15,7 +15,6 @@ from src.orchestrator.pipeline import ConciliationPipeline
 config = load_config("config/settings.yaml")
 config.setdefault("agent", {})["year"] = 2026
 config["agent"]["dry_run"] = False
-config["agent"]["skip_write_back"] = False
 
 pipeline = ConciliationPipeline(config)
 

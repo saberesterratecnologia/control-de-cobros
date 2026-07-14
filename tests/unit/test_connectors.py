@@ -91,6 +91,7 @@ def test_sqlserver_connector_queries_are_parameterized(mock_connect: MagicMock) 
             Decimal("10000"),
             Decimal("24000"),
             Decimal("12000"),
+            None,
             5,
             9,
             datetime(2026, 1, 1).date(),
@@ -118,115 +119,4 @@ def test_sqlserver_connector_queries_are_parameterized(mock_connect: MagicMock) 
     assert executed_params == (60,)
 
 
-@patch("src.connectors.sqlserver.pyodbc.connect")
-def test_sqlserver_get_unconciliated_payments_filters_correctly(mock_connect: MagicMock) -> None:
-    fake_cursor = MagicMock()
-    fake_connection = MagicMock()
-    fake_connection.cursor.return_value = fake_cursor
-    mock_connect.return_value = fake_connection
 
-    fake_cursor.execute.return_value.fetchall.return_value = [
-        (
-            99,
-            datetime(2026, 5, 10, 12, 0, 0),
-            Decimal("5000"),
-            "OP-99",
-            10,
-            2,
-            datetime(2026, 5, 10, 12, 5, 0),
-            False,
-            None,
-            2,
-            -1,
-            2,
-            None,
-            None,
-            False,
-            "pendiente",
-        )
-    ]
-
-    connector = SQLServerConnector(
-        {
-            "driver": "ODBC Driver 17 for SQL Server",
-            "server": "localhost",
-            "database": "test",
-            "trusted_connection": True,
-        }
-    )
-    connector.connect()
-
-    payments = connector.get_unconciliated_payments(year=2026, id_organizacion=2)
-
-    assert len(payments) == 1
-    assert payments[0].id_pago_mp == 99
-
-    executed_query, executed_params = fake_cursor.execute.call_args[0]
-    assert "id_movimiento_bancario IS NULL OR p.id_movimiento_bancario <= 0" in executed_query
-
-
-@patch("src.connectors.sqlserver.pyodbc.connect")
-def test_persist_payment_movement_conciliation_updates_transactionally(mock_connect: MagicMock) -> None:
-    fake_cursor = MagicMock()
-    fake_connection = MagicMock()
-    fake_connection.cursor.return_value = fake_cursor
-    mock_connect.return_value = fake_connection
-    fake_cursor.fetchone.side_effect = [
-        (-1,),
-        (False,),
-        None,
-        (-1,),
-        (False,),
-    ]
-
-    connector = SQLServerConnector(
-        {
-            "driver": "ODBC Driver 17 for SQL Server",
-            "server": "localhost",
-            "database": "test",
-            "trusted_connection": True,
-        }
-    )
-    connector.connect()
-
-    status = connector.persist_payment_movement_conciliation(101, 202)
-
-    assert status == "updated"
-    fake_connection.commit.assert_called_once()
-    fake_connection.rollback.assert_not_called()
-    assert any(
-        "UPDATE PAGO_MERCADO_PAGO SET id_movimiento_bancario = ?" in call.args[0]
-        for call in fake_cursor.execute.call_args_list
-    )
-    assert any(
-        "UPDATE MOVIMIENTO_BANCARIO SET conciliado = ?" in call.args[0]
-        for call in fake_cursor.execute.call_args_list
-    )
-
-
-@patch("src.connectors.sqlserver.pyodbc.connect")
-def test_persist_payment_movement_conciliation_detects_conflict(mock_connect: MagicMock) -> None:
-    fake_cursor = MagicMock()
-    fake_connection = MagicMock()
-    fake_connection.cursor.return_value = fake_cursor
-    mock_connect.return_value = fake_connection
-    fake_cursor.fetchone.side_effect = [
-        (-1,),
-        (False,),
-        (999,),
-    ]
-
-    connector = SQLServerConnector(
-        {
-            "driver": "ODBC Driver 17 for SQL Server",
-            "server": "localhost",
-            "database": "test",
-            "trusted_connection": True,
-        }
-    )
-    connector.connect()
-
-    status = connector.persist_payment_movement_conciliation(101, 202)
-
-    assert status == "conflict"
-    fake_connection.commit.assert_not_called()
