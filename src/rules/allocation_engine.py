@@ -113,6 +113,12 @@ class AllocationEngine:
         if self.cuota_price is None:
             self.total_cuotas = 0
 
+        # Explicit single-payment price from the commission
+        raw_pago_unico = commission.valor_pago_unico
+        self.pago_unico_price: Decimal | None = (
+            raw_pago_unico if raw_pago_unico and raw_pago_unico > 0 else None
+        )
+
         # All known single-concept prices for matching
         self._inscription_prices: list[Decimal] = [
             p for p in [self.inscription_price, self.inscription_price_full] if p is not None and p > 0
@@ -330,6 +336,16 @@ class AllocationEngine:
         if insc is None and cuota is None:
             return None
 
+        # Zero-cuotas: no cuota logic applies — match inscription or pago_unico only
+        if self.total_cuotas == 0 and self.cuota_price is None:
+            for candidate_insc in self._inscription_prices:
+                if self._single_concept_amount(monto, candidate_insc, None) is not None:
+                    concept = "Pago Único" if self.is_short_course_single_payment else "Inscripción"
+                    return [self._make_alloc(cp, concept, candidate_insc, has_cobro)]
+            if self.pago_unico_price is not None and monto == self.pago_unico_price:
+                return [self._make_alloc(cp, "Pago Único", monto, has_cobro)]
+            return None  # ambiguous — no cuota fallback possible
+
         # DB concept hint: 1=inscription, 2=cuota, 4=recargo (surcharge on
         # late cuota).  When the DB explicitly marks the payment as cuota or
         # recargo, skip inscription matching even if the monto happens to
@@ -348,6 +364,10 @@ class AllocationEngine:
                 if amount is not None:
                     concept = "Pago Único" if self.is_short_course_single_payment else "Inscripción"
                     return [self._make_alloc(cp, concept, amount, has_cobro)]
+
+        # --- exact pago_unico match (before cuota matching) ---
+        if self.pago_unico_price is not None and monto == self.pago_unico_price:
+            return [self._make_alloc(cp, "Pago Único", monto, has_cobro)]
 
         # --- exact / near cuota (bonified or full price) ---
         if not db_says_inscription and inscription_context:
@@ -857,6 +877,22 @@ class AllocationEngine:
                             )
                         )
                         break
+
+        # Pago Único from explicit valor_pago_unico
+        if self.pago_unico_price is not None and self.pago_unico_price > 0:
+            ratio = float(monto / self.pago_unico_price)
+            if 0.90 <= ratio <= 1.10:
+                candidates.append(
+                    AllocationCandidate(
+                        concept="Pago Único",
+                        amount=self.pago_unico_price,
+                        score=max(0.0, 1.0 - abs(1.0 - ratio) * 5),
+                        reasoning=(
+                            f"Monto {monto} is {ratio:.1%} of valor_pago_unico "
+                            f"{self.pago_unico_price}"
+                        ),
+                    )
+                )
 
         # Fallback: unknown
         if not candidates:

@@ -9,7 +9,13 @@ from src.models.source import BankMovement, Commission, Payment, Student
 from src.rules.allocation_engine import AllocationEngine, Ledger
 
 
-def _commission(*, insc: str | None = "54800.00", cuota: str | None = "98640.00", total: int = 8) -> Commission:
+def _commission(
+    *,
+    insc: str | None = "54800.00",
+    cuota: str | None = "98640.00",
+    total: int = 8,
+    valor_pago_unico: str | None = None,
+) -> Commission:
     return Commission(
         id_comision=10,
         id_curso=60,
@@ -19,6 +25,7 @@ def _commission(*, insc: str | None = "54800.00", cuota: str | None = "98640.00"
         valor_inscripcion_promocion=Decimal(insc) if insc else None,
         valor_cuota=Decimal(cuota) if cuota else None,
         valor_cuota_bonificada=Decimal(cuota) if cuota else None,
+        valor_pago_unico=Decimal(valor_pago_unico) if valor_pago_unico else None,
         cantidad_cuotas=total,
         duracion_meses=9,
         fecha_inicio=date(2026, 1, 1),
@@ -26,7 +33,12 @@ def _commission(*, insc: str | None = "54800.00", cuota: str | None = "98640.00"
     )
 
 
-def _short_commission(*, insc_full: str = "259000.00", insc_promo: str = "229000.00") -> Commission:
+def _short_commission(
+    *,
+    insc_full: str = "259000.00",
+    insc_promo: str = "229000.00",
+    valor_pago_unico: str | None = None,
+) -> Commission:
     return Commission(
         id_comision=20,
         id_curso=80,
@@ -36,6 +48,7 @@ def _short_commission(*, insc_full: str = "259000.00", insc_promo: str = "229000
         valor_inscripcion_promocion=Decimal(insc_promo),
         valor_cuota=None,
         valor_cuota_bonificada=None,
+        valor_pago_unico=Decimal(valor_pago_unico) if valor_pago_unico else None,
         cantidad_cuotas=0,
         duracion_meses=4,
         fecha_inicio=date(2026, 1, 1),
@@ -125,6 +138,154 @@ def _sheet_row(
         id_movimiento_bancario=None,
         id_pago_mp=1,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Commission exposes valor_pago_unico
+# ---------------------------------------------------------------------------
+
+
+def test_commission_exposes_valor_pago_unico() -> None:
+    """Commission model accepts and stores valor_pago_unico field."""
+    c = _commission(valor_pago_unico="500000.00")
+    assert c.valor_pago_unico == Decimal("500000.00")
+
+    c_none = _commission()
+    assert c_none.valor_pago_unico is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Zero-cuotas allocation branch
+# ---------------------------------------------------------------------------
+
+
+def _zero_cuotas_commission(
+    *,
+    insc: str = "229000.00",
+    insc_promo: str = "229000.00",
+    valor_pago_unico: str | None = None,
+) -> Commission:
+    """Commission with cantidad_cuotas=0 and no cuota price (not short course)."""
+    return Commission(
+        id_comision=30,
+        id_curso=90,
+        id_organizacion=2,
+        nombre="Zero cuotas comm",
+        valor_inscripcion=Decimal(insc),
+        valor_inscripcion_promocion=Decimal(insc_promo),
+        valor_cuota=None,
+        valor_cuota_bonificada=None,
+        valor_pago_unico=Decimal(valor_pago_unico) if valor_pago_unico else None,
+        cantidad_cuotas=0,
+        duracion_meses=12,
+        fecha_inicio=date(2026, 1, 1),
+        borrado=False,
+    )
+
+
+def test_zero_cuotas_matches_inscription() -> None:
+    """cantidad_cuotas=0, cuota=None, monto==inscription → Inscripción."""
+    comm = _zero_cuotas_commission()
+    result = AllocationEngine(comm).allocate(
+        [_cp(amount="229000.00", concept_id=1)], [], _student(),
+    )
+    assert len(result.allocated) == 1
+    assert result.allocated[0].concept == "Inscripción"
+
+
+def test_zero_cuotas_matches_promo_inscription() -> None:
+    """cantidad_cuotas=0, monto==inscripcion_promocion → Inscripción."""
+    comm = _zero_cuotas_commission(insc="300000.00", insc_promo="250000.00")
+    result = AllocationEngine(comm).allocate(
+        [_cp(amount="250000.00", concept_id=1)], [], _student(),
+    )
+    assert len(result.allocated) == 1
+    assert result.allocated[0].concept == "Inscripción"
+
+
+def test_zero_cuotas_matches_pago_unico() -> None:
+    """cantidad_cuotas=0, monto==valor_pago_unico → Pago Único."""
+    comm = _zero_cuotas_commission(valor_pago_unico="500000.00")
+    result = AllocationEngine(comm).allocate(
+        [_cp(amount="500000.00", concept_id=1)], [], _student(),
+    )
+    assert len(result.allocated) == 1
+    assert result.allocated[0].concept == "Pago Único"
+
+
+def test_zero_cuotas_unmatched_returns_none() -> None:
+    """cantidad_cuotas=0, pago_unico=None, monto≠inscription → ambiguous."""
+    comm = _zero_cuotas_commission()
+    result = AllocationEngine(comm).allocate(
+        [_cp(amount="999999.00", concept_id=1)], [], _student(),
+    )
+    assert len(result.allocated) == 0
+    assert len(result.ambiguous) == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Pago Único for cuota-based commissions
+# ---------------------------------------------------------------------------
+
+
+def test_cuota_based_matches_pago_unico() -> None:
+    """cuotas=8, monto==valor_pago_unico → Pago Único (before cuota matching)."""
+    comm = _commission(valor_pago_unico="750000.00")
+    # Pay inscription first, then the pago_unico amount
+    insc_cp = _cp(amount="54800.00", concept_id=1, id_pago=1)
+    insc_cp.payment.fecha = datetime(2026, 1, 5, 12, 0, 0)
+    pago_cp = _cp(amount="750000.00", concept_id=2, id_pago=2)
+    pago_cp.payment.fecha = datetime(2026, 2, 10, 12, 0, 0)
+    result = AllocationEngine(comm).allocate([insc_cp, pago_cp], [], _student())
+    concepts = [a.concept for a in result.allocated]
+    assert "Pago Único" in concepts
+    pago = next(a for a in result.allocated if a.concept == "Pago Único")
+    assert pago.amount == Decimal("750000.00")
+
+
+def test_cuota_based_no_pago_unico_unchanged() -> None:
+    """cuotas=8, valor_pago_unico=None, monto==cuota → existing Cuota N behavior."""
+    comm = _commission()  # no valor_pago_unico
+    result = AllocationEngine(comm).allocate(
+        [_cp(amount="54800.00", concept_id=1, id_pago=1), _cp(amount="98640.00", concept_id=2, id_pago=2)],
+        [],
+        _student(),
+    )
+    concepts = [a.concept for a in result.allocated]
+    assert concepts == ["Inscripción", "Cuota 1"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Candidates + Plausibility
+# ---------------------------------------------------------------------------
+
+
+def test_pago_unico_candidate_generated() -> None:
+    """_generate_candidates includes Pago Único when pago_unico_price is set and monto within 10%."""
+    comm = _commission(valor_pago_unico="750000.00")
+    engine = AllocationEngine(comm)
+    # monto within 10% of valor_pago_unico
+    cp = _cp(amount="740000.00", concept_id=2)
+    ledger = Ledger(inscription_paid=True)
+    candidates = engine._generate_candidates(cp, ledger)
+    pago_candidates = [c for c in candidates if c.concept == "Pago Único"]
+    assert len(pago_candidates) >= 1
+    assert pago_candidates[0].amount == Decimal("750000.00")
+
+
+def test_plausibility_accepts_explicit_pago_unico() -> None:
+    """_is_monto_plausible_for_concept returns True when valor_pago_unico matches monto.
+
+    Uses a valor_pago_unico that is far from cuota*cant so only the explicit
+    valor_pago_unico candidate makes it plausible.
+    """
+    from src.orchestrator.pipeline import ConciliationPipeline
+    # cuota*cant = 98640*8 = 789120 — a 400000 pago_unico is well outside 30% of that
+    comm = _commission(valor_pago_unico="400000.00")
+    result = ConciliationPipeline._is_monto_plausible_for_concept(
+        Decimal("400000.00"), "Pago Único", comm,
+    )
+    assert result is True
 
 
 def test_exact_inscription_allocation() -> None:

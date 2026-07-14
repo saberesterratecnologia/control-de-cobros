@@ -80,6 +80,7 @@ class Commission(BaseModel):
     valor_inscripcion_promocion: Decimal | None
     valor_cuota: Decimal | None = None
     valor_cuota_bonificada: Decimal | None
+    valor_pago_unico: Decimal | None = None
     cantidad_cuotas: int | None
     duracion_meses: int | None = None
     fecha_inicio: date | None
