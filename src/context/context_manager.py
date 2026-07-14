@@ -233,6 +233,21 @@ class ContextManager:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def _has_open_ambiguous_review_for_payment(self, payment_id: int) -> int | None:
+        """Return the id of an existing open ambiguous review for this payment_id, or None."""
+        conn = self._require_connection()
+        row = conn.execute(
+            """
+            SELECT id FROM pending_reviews
+            WHERE status = 'open'
+              AND reason LIKE '%ambiguous%'
+              AND json_extract(context_json, '$.payment_id') = ?
+            LIMIT 1
+            """,
+            (payment_id,),
+        ).fetchone()
+        return row[0] if row else None
+
     def save_pending_review(
         self,
         run_id: str,
@@ -242,6 +257,13 @@ class ContextManager:
         status: str = "open",
     ) -> int:
         conn = self._require_connection()
+
+        # Creation-time dedup guard: skip insert for duplicate ambiguous reviews
+        if "ambiguous" in reason and context_json and context_json.get("payment_id"):
+            existing_id = self._has_open_ambiguous_review_for_payment(context_json["payment_id"])
+            if existing_id is not None:
+                return existing_id
+
         cursor = conn.execute(
             """
             INSERT INTO pending_reviews (run_id, discrepancy_id, reason, context_json, status)
@@ -454,3 +476,43 @@ class ContextManager:
             (run_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # --- Stale-review evaluation helpers ---
+
+    def get_open_reviews_for_student(self, commission: str, dni: str) -> list[dict[str, Any]]:
+        """Return open guard reviews matching commission+DNI via json_extract."""
+        conn = self._require_connection()
+        rows = conn.execute(
+            """
+            SELECT * FROM pending_reviews
+            WHERE status = 'open'
+              AND reason LIKE 'guard:%'
+              AND json_extract(context_json, '$.commission') = ?
+              AND json_extract(context_json, '$.dni') = ?
+            ORDER BY id
+            """,
+            (commission, dni),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_open_anomaly_reviews_for_rows(self, row_numbers: list[int]) -> list[dict[str, Any]]:
+        """Return open anomaly reviews whose row_number is in the given set."""
+        if not row_numbers:
+            return []
+        conn = self._require_connection()
+        placeholders = ",".join("?" * len(row_numbers))
+        rows = conn.execute(
+            f"""
+            SELECT * FROM pending_reviews
+            WHERE status = 'open'
+              AND reason LIKE 'anomaly:%'
+              AND json_extract(context_json, '$.row_number') IN ({placeholders})
+            ORDER BY id
+            """,
+            row_numbers,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def close_review(self, review_id: int, reason: str) -> None:
+        """Mark review as resolved with auto-close reason."""
+        self.update_pending_review_resolution(review_id, reviewer_notes=reason, status="resolved")

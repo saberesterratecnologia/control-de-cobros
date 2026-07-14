@@ -1,11 +1,15 @@
-"""Unit tests for ReviewManager.build_problem_summary and _format_monto.
+"""Unit tests for ReviewManager.build_problem_summary, _format_monto, and export dedup.
 
 These tests exercise pure functions that do NOT require database or
 Google Sheets connections.  ReviewManager is instantiated with None
 dependencies since the tested methods never touch them.
+Export dedup tests use lightweight mocks for sheets and context_manager.
 """
 
 from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -293,6 +297,50 @@ class TestAmbiguousRealCandidates:
         assert "Inscripción=$52.050" in d
         assert "Cuota=$10.000" in d
 
+    def test_pricing_suffix_includes_pago_unico(self):
+        """Pricing suffix renders Pago Único when present in commission_prices."""
+        ctx = {
+            "commission": "Comision PU",
+            "dni": "77778888",
+            "payment_id": 1234,
+            "monto": "500000",
+            "fecha": "2026-07-01",
+            "candidates": [
+                {"concept": "Pago Único", "amount": "500000"},
+            ],
+            "commission_prices": {
+                "inscripcion": "52050",
+                "cuota": "10000",
+                "pago_unico": "500000",
+            },
+        }
+        p, d = RM.build_problem_summary("ambiguous", ctx)
+        assert p == "Requiere definición de concepto"
+        assert "Inscripción=$52.050" in d
+        assert "Cuota=$10.000" in d
+        assert "Pago Único=$500.000" in d
+
+    def test_pricing_suffix_omits_pago_unico_when_absent(self):
+        """Pricing suffix does NOT include Pago Único when key is missing."""
+        ctx = {
+            "commission": "Comision NoPU",
+            "dni": "99990000",
+            "payment_id": 5678,
+            "monto": "15000",
+            "fecha": "2026-07-01",
+            "candidates": [
+                {"concept": "Cuota 1", "amount": "15000"},
+            ],
+            "commission_prices": {
+                "inscripcion": "52050",
+                "cuota": "10000",
+            },
+        }
+        p, d = RM.build_problem_summary("ambiguous", ctx)
+        assert "Inscripción=$52.050" in d
+        assert "Cuota=$10.000" in d
+        assert "Pago Único" not in d
+
 
 # ===================================================================
 # 5. Anomalies
@@ -439,3 +487,135 @@ class TestExistingCategories:
         p, d = RM.build_problem_summary("something_new", ctx)
         assert p == "Requiere revisión"
         assert "unknown_type" in d
+
+
+# ===================================================================
+# 7. Export dedup by payment_id
+# ===================================================================
+
+
+def _make_export_rm(open_reviews: list[dict]) -> tuple[ReviewManager, MagicMock]:
+    """Create a ReviewManager wired for export_to_sheet tests.
+
+    Returns (rm, worksheet_mock).
+    """
+    worksheet = MagicMock()
+    worksheet.row_values.return_value = ReviewManager.HEADER
+    worksheet.get_all_values.return_value = [ReviewManager.HEADER]
+
+    sheets = MagicMock()
+    sheets._client = MagicMock()
+    spreadsheet = MagicMock()
+    sheets._client.open_by_key.return_value = spreadsheet
+    spreadsheet.worksheet.return_value = worksheet
+
+    ctx_mgr = MagicMock()
+    ctx_mgr.get_all_open_reviews.return_value = open_reviews
+
+    config = {"sheets": {"spreadsheet_id": "fake-id"}}
+    rm = ReviewManager(sheets_connector=sheets, context_manager=ctx_mgr, config=config)
+    return rm, worksheet
+
+
+class TestExportDedupByPaymentId:
+    """Verify export_to_sheet deduplicates ambiguous reviews by payment_id."""
+
+    def test_export_dedup_by_payment_id(self) -> None:
+        """Two ambiguous reviews with same payment_id: only the first (lowest id) is exported."""
+        reviews = [
+            {
+                "id": 1,
+                "reason": "ambiguous_allocation:auto",
+                "context_json": json.dumps({
+                    "payment_id": 500,
+                    "commission": "C1",
+                    "dni": "111",
+                    "monto": "10000",
+                    "fecha": "2026-01-01",
+                    "candidates": [{"concept": "Cuota 1", "amount": "10000"}],
+                }),
+            },
+            {
+                "id": 2,
+                "reason": "ambiguous_allocation:manual",
+                "context_json": json.dumps({
+                    "payment_id": 500,
+                    "commission": "C2",
+                    "dni": "222",
+                    "monto": "10000",
+                    "fecha": "2026-01-01",
+                    "candidates": [{"concept": "Cuota 2", "amount": "10000"}],
+                }),
+            },
+        ]
+        rm, ws = _make_export_rm(reviews)
+        result = rm.export_to_sheet()
+
+        assert result["exported"] == 1
+        assert result["skipped"] == 1
+        # Verify the exported row is REV-1 (lowest id)
+        appended = ws.append_rows.call_args[0][0]
+        assert len(appended) == 1
+        assert appended[0][0] == "REV-1"
+
+    def test_export_no_dedup_for_non_ambiguous(self) -> None:
+        """pago_no_controlado reviews with same payment_id: both exported."""
+        reviews = [
+            {
+                "id": 10,
+                "reason": "pago_no_controlado",
+                "context_json": json.dumps({
+                    "payment_id": 600,
+                    "commission": "C3",
+                    "dni": "333",
+                    "monto": "5000",
+                    "fecha": "2026-02-01",
+                }),
+            },
+            {
+                "id": 11,
+                "reason": "pago_no_controlado",
+                "context_json": json.dumps({
+                    "payment_id": 600,
+                    "commission": "C4",
+                    "dni": "444",
+                    "monto": "5000",
+                    "fecha": "2026-02-01",
+                }),
+            },
+        ]
+        rm, ws = _make_export_rm(reviews)
+        result = rm.export_to_sheet()
+
+        assert result["exported"] == 2
+
+    def test_export_no_dedup_without_payment_id(self) -> None:
+        """Ambiguous reviews without payment_id: all exported through existing rules."""
+        reviews = [
+            {
+                "id": 20,
+                "reason": "ambiguous_allocation:auto",
+                "context_json": json.dumps({
+                    "commission": "C5",
+                    "dni": "555",
+                    "monto": "8000",
+                    "fecha": "2026-03-01",
+                    "candidates": [{"concept": "Cuota 1", "amount": "8000"}],
+                }),
+            },
+            {
+                "id": 21,
+                "reason": "ambiguous_allocation:manual",
+                "context_json": json.dumps({
+                    "commission": "C6",
+                    "dni": "666",
+                    "monto": "8000",
+                    "fecha": "2026-03-01",
+                    "candidates": [{"concept": "Cuota 2", "amount": "8000"}],
+                }),
+            },
+        ]
+        rm, ws = _make_export_rm(reviews)
+        result = rm.export_to_sheet()
+
+        assert result["exported"] == 2

@@ -234,7 +234,11 @@ class ReviewManager:
             if commission_prices.get("inscripcion") or commission_prices.get("cuota"):
                 insc_fmt = self._format_monto(commission_prices.get("inscripcion"))
                 cuota_fmt = self._format_monto(commission_prices.get("cuota"))
-                pricing_suffix = f" (Inscripción={insc_fmt}, Cuota={cuota_fmt})"
+                parts = [f"Inscripción={insc_fmt}", f"Cuota={cuota_fmt}"]
+                if commission_prices.get("pago_unico"):
+                    pu_fmt = self._format_monto(commission_prices.get("pago_unico"))
+                    parts.append(f"Pago Único={pu_fmt}")
+                pricing_suffix = f" ({', '.join(parts)})"
 
             if all_unknown:
                 return (
@@ -473,6 +477,7 @@ class ReviewManager:
 
         rows_to_append: list[list[str]] = []
         skipped = 0
+        seen_payment_ids: set[int] = set()
         for review in open_reviews:
             case_id = f"REV-{review['id']}"
             if case_id in existing_case_ids:
@@ -480,7 +485,8 @@ class ReviewManager:
                 continue
 
             context_json = json.loads(review.get("context_json") or "{}")
-            problema, detalle = self.build_problem_summary(review.get("reason", ""), context_json)
+            reason = review.get("reason", "")
+            problema, detalle = self.build_problem_summary(reason, context_json)
             comision = str(context_json.get("commission") or "").strip()
             dni = str(context_json.get("dni") or "").strip()
 
@@ -491,6 +497,14 @@ class ReviewManager:
                 )
                 skipped += 1
                 continue
+
+            # Export-time dedup: only one ambiguous review per payment_id
+            payment_id = context_json.get("payment_id")
+            if payment_id is not None and "ambiguous" in reason:
+                if payment_id in seen_payment_ids:
+                    skipped += 1
+                    continue
+                seen_payment_ids.add(payment_id)
 
             content_key = self._dedup_key(comision, dni, problema, detalle)
             if content_key in existing_content_keys:
