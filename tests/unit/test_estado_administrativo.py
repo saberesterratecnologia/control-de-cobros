@@ -40,27 +40,41 @@ class TestExtractMaxCuota:
 
 class TestExpectedCuotasPaid:
     def test_same_month_returns_zero(self) -> None:
-        """Current month is not yet due."""
+        """Start month is always inside the grace window."""
         assert expected_cuotas_paid(date(2026, 6, 1), date(2026, 6, 15)) == 0
 
     def test_today_before_start_returns_zero(self) -> None:
         assert expected_cuotas_paid(date(2026, 6, 1), date(2026, 5, 1)) == 0
 
-    def test_one_month_later(self) -> None:
-        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 4, 1)) == 1
+    def test_following_month_before_grace_day_still_zero(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 4, 1)) == 0
 
-    def test_three_months_later(self) -> None:
-        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 6, 1)) == 3
+    def test_following_month_grace_day_still_keeps_first_cuota_out(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 4, 15)) == 0
 
-    def test_march_to_june(self) -> None:
-        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 6, 1)) == 3
+    def test_following_month_day_after_grace_counts_first_cuota(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 4, 16)) == 1
 
-    def test_day_doesnt_matter(self) -> None:
-        """Only month difference counts, not day-of-month."""
-        assert expected_cuotas_paid(date(2026, 3, 15), date(2026, 6, 20)) == 3
+    def test_july_first_only_counts_through_may(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 7, 1)) == 3
+
+    def test_july_fifteenth_keeps_june_in_grace(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 7, 15)) == 3
+
+    def test_july_sixteenth_counts_june(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 7, 16)) == 4
+
+    def test_august_first_keeps_july_in_grace(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 8, 1)) == 4
+
+    def test_august_fifteenth_keeps_july_in_grace(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 8, 15)) == 4
+
+    def test_august_sixteenth_counts_july(self) -> None:
+        assert expected_cuotas_paid(date(2026, 3, 1), date(2026, 8, 16)) == 5
 
     def test_cross_year(self) -> None:
-        assert expected_cuotas_paid(date(2025, 11, 1), date(2026, 2, 1)) == 3
+        assert expected_cuotas_paid(date(2025, 11, 1), date(2026, 2, 1)) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -68,32 +82,32 @@ class TestExpectedCuotasPaid:
 # ---------------------------------------------------------------------------
 
 class TestDetermineNewState:
-    def test_paid_equals_expected_sin_deuda(self) -> None:
-        assert determine_new_state(cuotas_paid=3, expected=3, total_cuotas=12) == 5
+    def test_before_grace_day_missing_previous_month_is_still_sin_deuda(self) -> None:
+        assert determine_new_state({1, 2, 3}, date(2026, 3, 1), date(2026, 7, 14), 12) == 5
 
-    def test_one_behind_deuda_1_mes(self) -> None:
-        assert determine_new_state(cuotas_paid=2, expected=3, total_cuotas=12) == 6
+    def test_grace_day_still_keeps_same_deficit_sin_deuda(self) -> None:
+        assert determine_new_state({1, 2, 3}, date(2026, 3, 1), date(2026, 7, 15), 12) == 5
 
-    def test_two_behind_deuda_2_meses(self) -> None:
-        assert determine_new_state(cuotas_paid=1, expected=3, total_cuotas=12) == 7
+    def test_day_after_grace_moves_same_deficit_to_deuda_1_mes(self) -> None:
+        assert determine_new_state({1, 2, 3}, date(2026, 3, 1), date(2026, 7, 16), 12) == 6
 
-    def test_five_behind_still_deuda_2_meses(self) -> None:
-        assert determine_new_state(cuotas_paid=0, expected=5, total_cuotas=12) == 7
+    def test_first_day_of_next_month_escalates_same_deficit_to_deuda_2_meses(self) -> None:
+        assert determine_new_state({1, 2, 3}, date(2026, 3, 1), date(2026, 8, 1), 12) == 7
+
+    def test_paid_up_to_due_count_stays_sin_deuda(self) -> None:
+        assert determine_new_state({1, 2, 3, 4}, date(2026, 3, 1), date(2026, 8, 1), 12) == 5
 
     def test_zero_expected_zero_paid(self) -> None:
-        assert determine_new_state(cuotas_paid=0, expected=0, total_cuotas=12) == 5
+        assert determine_new_state(set(), date(2026, 6, 1), date(2026, 6, 10), 12) == 5
 
     def test_paid_ahead_sin_deuda(self) -> None:
-        assert determine_new_state(cuotas_paid=5, expected=3, total_cuotas=12) == 5
+        assert determine_new_state({1, 2, 3, 4, 5}, date(2026, 3, 1), date(2026, 7, 16), 12) == 5
+
+    def test_gap_uses_oldest_missing_cuota_age(self) -> None:
+        assert determine_new_state({1, 3}, date(2026, 3, 1), date(2026, 6, 20), 12) == 7
 
     def test_total_cuotas_caps_expected(self) -> None:
-        """If total_cuotas=6 and expected=10, expected is capped to 6.
-        Paid=6 means no deficit -> state 5."""
-        assert determine_new_state(cuotas_paid=6, expected=10, total_cuotas=6) == 5
-
-    def test_total_cuotas_zero_no_cap(self) -> None:
-        """total_cuotas=0 disables capping."""
-        assert determine_new_state(cuotas_paid=3, expected=5, total_cuotas=0) == 7
+        assert determine_new_state({1, 2, 3, 4, 5, 6}, date(2026, 3, 1), date(2027, 3, 1), 6) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -101,36 +115,18 @@ class TestDetermineNewState:
 # ---------------------------------------------------------------------------
 
 class TestBugFixMaxVsLen:
-    """Verify the fix: count DISTINCT cuotas, not the max cuota number.
+    """Verify the fix: use the real set of paid cuotas, not a simple counter.
 
     Scenario: student paid Cuota 1 and Cuota 3, skipping Cuota 2.
-    - Correct count: len({1, 3}) = 2
-    - Old buggy:    max([1, 3]) = 3
-
-    With expected=3:
-    - Fixed:  deficit = 3 - 2 = 1  -> state 6 (con deuda 1 mes) ✓
-    - Buggy:  deficit = 3 - 3 = 0  -> state 5 (sin deuda)       ✗
+    The debt state must be based on the missing cuota's age, not only on
+    how many cuotas exist.
     """
 
-    def test_skipped_cuota_shows_debt(self) -> None:
-        """With len() fix: 2 cuotas paid, expected 3 -> deficit 1 -> state 6."""
-        cuotas_paid = {1, 3}  # skipped cuota 2
-        cuotas_paid_count = len(cuotas_paid)
-
-        assert cuotas_paid_count == 2
-        assert determine_new_state(cuotas_paid_count, expected=3, total_cuotas=12) == 6
-
-    def test_old_max_logic_would_be_wrong(self) -> None:
-        """Demonstrate the old max() logic would have returned state 5 (wrong)."""
-        cuotas_paid = {1, 3}  # skipped cuota 2
-        buggy_count = max(cuotas_paid)  # old logic: 3
-
-        assert buggy_count == 3
-        # Old logic says no deficit — WRONG
-        assert determine_new_state(buggy_count, expected=3, total_cuotas=12) == 5
+    def test_skipped_cuota_uses_missing_month_not_only_count(self) -> None:
+        cuotas_paid = {1, 3}
+        assert determine_new_state(cuotas_paid, date(2026, 3, 1), date(2026, 6, 20), 12) == 7
 
     def test_sequential_cuotas_same_result(self) -> None:
-        """When cuotas ARE sequential, len() and max() agree."""
-        cuotas_paid = {1, 2, 3}
-        assert len(cuotas_paid) == max(cuotas_paid) == 3
-        assert determine_new_state(len(cuotas_paid), expected=3, total_cuotas=12) == 5
+        """When cuotas ARE sequential, the student stays out of debt."""
+        cuotas_paid = {1, 2, 3, 4}
+        assert determine_new_state(cuotas_paid, date(2026, 3, 1), date(2026, 7, 16), 12) == 5
