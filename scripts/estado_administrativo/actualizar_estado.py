@@ -241,7 +241,7 @@ def run_update(
             AND cp.analisis_pagos = 1
             AND p.borrada = 0
             AND cp.id_rol = 1
-            AND cp.id_estado_academico IN (2, 4, 5, 6, 8)
+            AND cp.id_estado_academico IN (2, 4, 5, 6, 8, 9)
             ORDER BY p.apellidos, p.nombres
         """, (id_comision,))
         students = cursor.fetchall()
