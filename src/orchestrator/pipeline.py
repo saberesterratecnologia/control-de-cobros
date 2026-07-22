@@ -1172,6 +1172,9 @@ class ConciliationPipeline:
                         "monto": str(discrepancy.expected_row.monto) if discrepancy.expected_row else (
                             str(discrepancy.actual_row.monto) if discrepancy.actual_row else None
                         ),
+                        "payment_id": discrepancy.expected_row.id_pago_mp if discrepancy.expected_row else (
+                            discrepancy.actual_row.id_pago_mp if discrepancy.actual_row else None
+                        ),
                     },
                 )
 

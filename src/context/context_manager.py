@@ -302,6 +302,28 @@ class ContextManager:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_open_grouped_reviews(
+        self,
+        commission: str,
+        dni: str,
+        payment_id: int,
+    ) -> list[dict[str, Any]]:
+        conn = self._require_connection()
+        rows = conn.execute(
+            """
+            SELECT * FROM pending_reviews
+            WHERE status = 'open'
+              AND json_extract(context_json, '$.commission') = ?
+              AND json_extract(context_json, '$.dni') = ?
+              AND json_extract(context_json, '$.payment_id') = ?
+              AND json_extract(context_json, '$.type') = 'wrong_value'
+              AND json_extract(context_json, '$.field') IN ('concepto', 'fecha_movimiento')
+            ORDER BY id
+            """,
+            (commission, dni, payment_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def update_pending_review_resolution(
         self,
         pending_review_id: int,

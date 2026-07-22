@@ -18,6 +18,7 @@ class ReviewManager:
     CLEANUP_HEADER = ["case_id", "comision", "dni", "tipo", "resumen", "estado", "nota"]
     _CLEANUP_DONE_STATES = {"HECHO", "OK", "LISTO"}
     _CLEANUP_IGNORE_STATES = {"IGNORAR", "OMITIR"}
+    _GROUP_WRONG_VALUE_FIELDS = {"concepto", "fecha_movimiento"}
 
     # Priority order for guard:invalid_sequence reasons (higher index = more severe).
     _GUARD_REASON_SEVERITY: dict[str, int] = {
@@ -572,6 +573,72 @@ class ReviewManager:
         """
         return f"{comision.strip()}|{dni.strip()}|{problema.strip()}|{detalle.strip()}"
 
+    @staticmethod
+    def _group_case_id(payment_id: int) -> str:
+        return f"GRP-{payment_id}-WF"
+
+    def _group_review_export_data(self, review: dict[str, Any]) -> dict[str, Any] | None:
+        reason = review.get("reason", "")
+        if reason.startswith("ambiguous") or reason.startswith("guard:") or reason.startswith("anomaly:"):
+            return None
+
+        context_json = json.loads(review.get("context_json") or "{}")
+        if context_json.get("type") != "wrong_value":
+            return None
+        if str(context_json.get("field") or "") not in self._GROUP_WRONG_VALUE_FIELDS:
+            return None
+
+        payment_id = context_json.get("payment_id")
+        commission = str(context_json.get("commission") or "").strip()
+        dni = str(context_json.get("dni") or "").strip()
+        if payment_id is None or not commission or not dni:
+            return None
+
+        return {
+            "payment_id": int(payment_id),
+            "commission": commission,
+            "dni": dni,
+            "context_json": context_json,
+        }
+
+    @staticmethod
+    def _concept_display(concepts: list[str]) -> str:
+        cleaned = [c.strip() for c in concepts if c and c.strip()]
+        if not cleaned:
+            return "pago"
+        unique: list[str] = []
+        for concept in cleaned:
+            if concept not in unique:
+                unique.append(concept)
+        if len(unique) == 1:
+            return unique[0]
+        if len(unique) <= 3:
+            return ", ".join(unique)
+        return f"{', '.join(unique[:3])} +{len(unique) - 3}"
+
+    def _build_grouped_review_row(self, reviews: list[dict[str, Any]]) -> list[str] | None:
+        if not reviews:
+            return None
+        contexts = [json.loads(review.get("context_json") or "{}") for review in reviews]
+        payment_id = contexts[0].get("payment_id")
+        commission = str(contexts[0].get("commission") or "").strip()
+        dni = str(contexts[0].get("dni") or "").strip()
+        concepts = [str(ctx.get("concepto") or "").strip() for ctx in contexts]
+        fields = {str(ctx.get("field") or "") for ctx in contexts}
+
+        if not payment_id or not commission or not dni:
+            return None
+
+        if fields == {"concepto"}:
+            problema = "Revisar concepto"
+        elif fields == {"fecha_movimiento"}:
+            problema = "Revisar fecha"
+        else:
+            problema = "Revisar fecha/concepto"
+
+        detalle = f"Pago {payment_id} — {self._concept_display(concepts)}"
+        return [self._group_case_id(int(payment_id)), commission, dni, problema, detalle, ""]
+
     def export_to_sheet(self, run_id: str | None = None) -> dict[str, int]:
         worksheet = self._get_revisiones_sheet()
         if worksheet is None:
@@ -579,13 +646,15 @@ class ReviewManager:
         open_reviews = self.context.get_all_open_reviews(run_id=run_id)
 
         existing_case_ids = set()
+        case_rows: dict[str, int] = {}
         existing_content_keys: set[str] = set()
         all_values = worksheet.get_all_values()
-        for row in all_values[1:]:
+        for idx, row in enumerate(all_values[1:], start=2):
             if not row:
                 continue
             if row[0].strip():
                 existing_case_ids.add(row[0].strip())
+                case_rows[row[0].strip()] = idx
             # Build content key from columns: comision(1), dni(2), problema(3), detalle(4)
             if len(row) >= 5:
                 existing_content_keys.add(
@@ -593,9 +662,43 @@ class ReviewManager:
                 )
 
         rows_to_append: list[list[str]] = []
+        rows_to_delete: list[int] = []
         skipped = 0
         seen_payment_ids: set[int] = set()
+        grouped_reviews: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+        individual_reviews: list[dict[str, Any]] = []
+
         for review in open_reviews:
+            grouped = self._group_review_export_data(review)
+            if grouped is not None:
+                key = (grouped["commission"], grouped["dni"], grouped["payment_id"])
+                grouped_reviews.setdefault(key, []).append(review)
+                continue
+            individual_reviews.append(review)
+
+        for reviews in grouped_reviews.values():
+            row = self._build_grouped_review_row(reviews)
+            if row is None:
+                skipped += len(reviews)
+                continue
+            case_id = row[0]
+            content_key = self._dedup_key(row[1], row[2], row[3], row[4])
+            member_case_ids = {f"REV-{review['id']}" for review in reviews}
+            obsolete_rows = [case_rows[cid] for cid in member_case_ids if cid in case_rows]
+
+            if case_id in existing_case_ids:
+                skipped += len(reviews)
+                rows_to_delete.extend(obsolete_rows)
+                continue
+            if content_key in existing_content_keys and not obsolete_rows:
+                skipped += len(reviews)
+                continue
+
+            existing_content_keys.add(content_key)
+            rows_to_append.append(row)
+            rows_to_delete.extend(obsolete_rows)
+
+        for review in individual_reviews:
             case_id = f"REV-{review['id']}"
             if case_id in existing_case_ids:
                 skipped += 1
@@ -640,6 +743,8 @@ class ReviewManager:
 
         if rows_to_append:
             worksheet.append_rows(rows_to_append, value_input_option="RAW")
+        for row_num in sorted(set(rows_to_delete), reverse=True):
+            worksheet.delete_rows(row_num)
 
         return {"exported": len(rows_to_append), "skipped": skipped}
 
@@ -766,6 +871,37 @@ class ReviewManager:
                 continue
 
             try:
+                group_match = re.match(r"^GRP-(\d+)-WF$", case_id)
+                if group_match is not None:
+                    payment_id = int(group_match.group(1))
+                    grouped_reviews = self.context.get_open_grouped_reviews(commission, dni, payment_id)
+                    if not grouped_reviews:
+                        rows_to_delete.append(idx)
+                        removed_stale += 1
+                        continue
+
+                    for pending in grouped_reviews:
+                        context_json = json.loads(pending.get("context_json") or "{}")
+                        similarity = self._extract_similarity_fields(pending.get("reason", ""), context_json)
+                        self.context.save_review_resolution(
+                            case_id=f"REV-{pending['id']}",
+                            run_id=pending.get("run_id"),
+                            commission=commission or str(context_json.get("commission") or ""),
+                            dni=dni or str(context_json.get("dni") or ""),
+                            problem=f"{problem}: {detalle}" if detalle else problem,
+                            resolution=resolution,
+                            monto=similarity["monto"],
+                            concepto_tipo=similarity["concepto_tipo"],
+                            pricing_inscripcion=similarity["pricing_inscripcion"],
+                            pricing_cuota=similarity["pricing_cuota"],
+                            monto_ratio=similarity["monto_ratio"],
+                        )
+                        self.context.update_pending_review_resolution(pending["id"], reviewer_notes=resolution)
+
+                    rows_to_delete.append(idx)
+                    synced += len(grouped_reviews)
+                    continue
+
                 match = re.match(r"^REV-(\d+)$", case_id)
                 if match is None:
                     raise ValueError(f"case_id inválido: {case_id}")

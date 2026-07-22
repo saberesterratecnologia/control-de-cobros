@@ -675,6 +675,89 @@ class TestExportDedupByPaymentId:
 
         assert result["exported"] == 2
 
+    def test_export_groups_wrong_value_reviews_by_payment_id(self) -> None:
+        reviews = [
+            {
+                "id": 30,
+                "reason": "gpt-4o",
+                "context_json": json.dumps({
+                    "payment_id": 900,
+                    "commission": "C7",
+                    "dni": "777",
+                    "type": "wrong_value",
+                    "field": "fecha_movimiento",
+                    "concepto": "Cuota 8",
+                    "monto": "10000",
+                }),
+            },
+            {
+                "id": 31,
+                "reason": "gpt-4o",
+                "context_json": json.dumps({
+                    "payment_id": 900,
+                    "commission": "C7",
+                    "dni": "777",
+                    "type": "wrong_value",
+                    "field": "concepto",
+                    "concepto": "Cuota 8",
+                    "monto": "10000",
+                }),
+            },
+        ]
+        rm, ws = _make_export_rm(reviews)
+
+        result = rm.export_to_sheet()
+
+        assert result["exported"] == 1
+        appended = ws.append_rows.call_args[0][0]
+        assert appended[0][0] == "GRP-900-WF"
+        assert appended[0][3] == "Revisar fecha/concepto"
+        assert "Pago 900" in appended[0][4]
+
+
+class TestGroupedReviewSync:
+    def test_sync_grouped_review_resolves_all_members(self) -> None:
+        rm, ws, ctx = _make_sync_rm([["GRP-900-WF", "Com A", "30111222", "Revisar fecha/concepto", "Pago 900 — Cuota 8", "Resolver asi"]])
+        ctx.get_open_grouped_reviews.return_value = [
+            {
+                "id": 30,
+                "run_id": "run-1",
+                "reason": "gpt-4o",
+                "context_json": json.dumps({
+                    "commission": "Com A",
+                    "dni": "30111222",
+                    "payment_id": 900,
+                    "type": "wrong_value",
+                    "field": "fecha_movimiento",
+                    "concepto": "Cuota 8",
+                    "monto": "10000",
+                    "commission_prices": {"cuota": "10000"},
+                }),
+            },
+            {
+                "id": 31,
+                "run_id": "run-1",
+                "reason": "gpt-4o",
+                "context_json": json.dumps({
+                    "commission": "Com A",
+                    "dni": "30111222",
+                    "payment_id": 900,
+                    "type": "wrong_value",
+                    "field": "concepto",
+                    "concepto": "Cuota 8",
+                    "monto": "10000",
+                    "commission_prices": {"cuota": "10000"},
+                }),
+            },
+        ]
+
+        result = rm.sync_resolutions()
+
+        assert result["synced"] == 2
+        assert ctx.save_review_resolution.call_count == 2
+        assert ctx.update_pending_review_resolution.call_count == 2
+        ws.delete_rows.assert_called_once_with(2)
+
 
 class TestCleanupTasks:
     def test_build_cleanup_tasks_from_non_blocking_guard(self) -> None:
