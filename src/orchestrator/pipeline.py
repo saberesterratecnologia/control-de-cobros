@@ -49,6 +49,7 @@ class _RunCounters:
     auto_fix: int = 0
     llm_decided: int = 0
     pending_review: int = 0
+    cleanup_tasks: int = 0
     sheet_anomalies: int = 0
     errors: int = 0
 
@@ -69,6 +70,7 @@ class ConciliationPipeline:
         self.review_manager = ReviewManager(self.sheets, self.context, config)
         self._run_id: str | None = None
         self._counters = _RunCounters()
+        self._cleanup_tasks: dict[str, dict[str, Any]] = {}
 
         llm = config.get("llm", {})
         self.auto_threshold = float(llm.get("confidence_threshold_auto", 0.90))
@@ -82,6 +84,7 @@ class ConciliationPipeline:
         with self.context, self.sql.connect(), self.sheets.connect():
             self._run_id = self.context.start_run(mode=mode, config_snapshot=self.config)
             try:
+                self.review_manager.sync_cleanup_statuses()
                 self.review_manager.sync_resolutions()
                 year = int(self.config["agent"]["year"])
                 id_organizacion = int(self.config["agent"].get("id_organizacion", 2))
@@ -150,14 +153,30 @@ class ConciliationPipeline:
                             tracked_commissions=tracked_commissions,
                         ):
                             continue
-                        self.context.save_pending_review(
-                            run_id=self._run_id,
-                            discrepancy_id=None,
+                        row = next((r for r in normalized_sheet_rows if r.row_number == anomaly.row_number), None)
+                        cleanup_context = anomaly.model_dump(mode="json")
+                        if row is not None:
+                            cleanup_context.update(
+                                {
+                                    "commission": (row.comision or "").strip(),
+                                    "dni": row.dni.strip(),
+                                    "concepto": row.concepto,
+                                    "monto": str(row.monto),
+                                    "id_movimiento_bancario": row.id_movimiento_bancario,
+                                }
+                            )
+                        self._record_cleanup_tasks(
                             reason=f"anomaly:{anomaly.anomaly_type}",
-                            context_json=anomaly.model_dump(mode="json"),
+                            context_json=cleanup_context,
                         )
+                        for review in self.context.get_open_anomaly_reviews_for_rows([anomaly.row_number]):
+                            self.context.close_review(review["id"], "auto_close:moved_to_cleanup")
                         processed_anomaly_rows.add(anomaly.row_number)
                         self._counters.sheet_anomalies += 1
+
+                if self._cleanup_tasks:
+                    self.review_manager.upsert_cleanup_tasks(self._run_id, list(self._cleanup_tasks.values()))
+                    self._counters.cleanup_tasks = len(self._cleanup_tasks)
 
                 summary = self._generate_summary(self._run_id)
                 summary["patch_summary"] = cumulative_patch_summary
@@ -170,8 +189,10 @@ class ConciliationPipeline:
                     # Export the full open backlog on every run so REVISIONES
                     # can self-heal after manual clears or skipped exports.
                     summary["reviews_export"] = self.review_manager.export_to_sheet()
+                    summary["cleanup_export"] = self.review_manager.export_cleanup_to_sheet()
                 else:
                     summary["reviews_export"] = {"exported": 0, "skipped": 0, "skipped_by_flag": True}
+                    summary["cleanup_export"] = {"exported": 0, "skipped": 0, "skipped_by_flag": True}
 
                 self.context.end_run(self._run_id, status="completed", summary=summary)
                 return summary
@@ -202,6 +223,7 @@ class ConciliationPipeline:
         self._counters = _RunCounters()
         self._discrepancy_ids = count(1)
         self.patch_builder.actions.clear()
+        self._cleanup_tasks.clear()
 
     @staticmethod
     def _merge_patch_summary(target: dict[str, Any], source: dict[str, Any]) -> None:
@@ -323,21 +345,25 @@ class ConciliationPipeline:
                     ", blocking allocation" if has_blocking else ", continuing (non-blocking)",
                     "; ".join(invalid_reasons),
                 )
-                self._counters.pending_review += 1
-                self.context.save_pending_review(
-                    run_id=self._run_id,
-                    discrepancy_id=None,
-                    reason="guard:invalid_sequence",
-                    context_json={
-                        "commission": commission.nombre.strip(),
-                        "dni": student.dni.strip(),
-                        "reasons": invalid_reasons,
-                        "blocking": has_blocking,
-                        "pricing_inscripcion": str(commission.valor_inscripcion_promocion or commission.valor_inscripcion or ""),
-                        "pricing_cuota": str(commission.valor_cuota_bonificada or commission.valor_cuota or ""),
-                        "cantidad_cuotas": commission.cantidad_cuotas,
-                    },
-                )
+                guard_context = {
+                    "commission": commission.nombre.strip(),
+                    "dni": student.dni.strip(),
+                    "reasons": invalid_reasons,
+                    "blocking": has_blocking,
+                    "pricing_inscripcion": str(commission.valor_inscripcion_promocion or commission.valor_inscripcion or ""),
+                    "pricing_cuota": str(commission.valor_cuota_bonificada or commission.valor_cuota or ""),
+                    "cantidad_cuotas": commission.cantidad_cuotas,
+                }
+                if has_blocking:
+                    self._counters.pending_review += 1
+                    self.context.save_pending_review(
+                        run_id=self._run_id,
+                        discrepancy_id=None,
+                        reason="guard:invalid_sequence",
+                        context_json=guard_context,
+                    )
+                else:
+                    self._record_cleanup_tasks("guard:invalid_sequence", guard_context)
                 if has_blocking:
                     return [], []
 
@@ -1392,6 +1418,17 @@ class ConciliationPipeline:
         for review in guard_reviews:
             ctx = json.loads(review.get("context_json") or "{}")
             review_reasons = set(ctx.get("reasons", []))
+            has_blocking_review_reason = any(
+                any(reason.startswith(prefix) for prefix in BLOCKING_GUARD_PREFIXES)
+                for reason in review_reasons
+            )
+            if not has_blocking_review_reason:
+                self.context.close_review(review["id"], "auto_close:moved_to_cleanup")
+                LOGGER.info(
+                    "auto-closed non-blocking guard review id=%s for %s DNI=%s",
+                    review["id"], commission_name, dni,
+                )
+                continue
             if not review_reasons & current_guard_set:
                 self.context.close_review(review["id"], "auto_close:guard_resolved")
                 LOGGER.info(
@@ -1405,6 +1442,13 @@ class ConciliationPipeline:
         for review in anomaly_reviews:
             reason = review.get("reason", "")
             anomaly_type = reason.split(":", 1)[1] if ":" in reason else reason
+            if anomaly_type in current_anomalies:
+                self.context.close_review(review["id"], "auto_close:moved_to_cleanup")
+                LOGGER.info(
+                    "auto-closed anomaly review moved to cleanup id=%s type=%s",
+                    review["id"], anomaly_type,
+                )
+                continue
             if anomaly_type not in current_anomalies:
                 self.context.close_review(review["id"], "auto_close:anomaly_resolved")
                 LOGGER.info(
@@ -1422,9 +1466,14 @@ class ConciliationPipeline:
             "auto_fix": self._counters.auto_fix,
             "llm_decided": self._counters.llm_decided,
             "pending_review": self._counters.pending_review,
+            "cleanup_tasks": self._counters.cleanup_tasks,
             "sheet_anomalies": self._counters.sheet_anomalies,
             "errors": self._counters.errors,
         }
+
+    def _record_cleanup_tasks(self, reason: str, context_json: dict[str, Any]) -> None:
+        for task in self.review_manager.build_cleanup_tasks(reason, context_json):
+            self._cleanup_tasks[task["task_key"]] = task
 
     @staticmethod
     def _is_direct_autofix_missing_row(discrepancy: Discrepancy) -> bool:

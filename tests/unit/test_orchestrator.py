@@ -773,8 +773,8 @@ class TestEvaluateStaleReviews:
         pipeline.context = ContextManager(":memory:", schema_path=_schema_path())
         return pipeline
 
-    def test_closes_guard_review_when_reasons_no_longer_match(self, sample_config, sample_commission):
-        """Guard review whose reasons have NO overlap with current → closed."""
+    def test_closes_non_blocking_guard_review_when_reasons_no_longer_match(self, sample_config, sample_commission):
+        """Non-blocking guard reviews now move to cleanup instead of staying in REVISIONES."""
         pipeline = self._make_pipeline_with_context(sample_config)
         with pipeline.context:
             run_id = pipeline.context.start_run()
@@ -796,10 +796,10 @@ class TestEvaluateStaleReviews:
                 "SELECT status, reviewer_notes FROM pending_reviews WHERE id = ?", (review_id,)
             ).fetchone()
             assert dict(row)["status"] == "resolved"
-            assert dict(row)["reviewer_notes"] == "auto_close:guard_resolved"
+            assert dict(row)["reviewer_notes"] == "auto_close:moved_to_cleanup"
 
-    def test_keeps_guard_review_open_when_reasons_still_overlap(self, sample_config, sample_commission):
-        """Guard review whose reasons still overlap with current → stays open."""
+    def test_closes_non_blocking_guard_review_when_reasons_still_overlap(self, sample_config, sample_commission):
+        """Non-blocking guard reviews are closed even if the issue still exists."""
         pipeline = self._make_pipeline_with_context(sample_config)
         with pipeline.context:
             run_id = pipeline.context.start_run()
@@ -818,9 +818,10 @@ class TestEvaluateStaleReviews:
             )
 
             row = pipeline.context._require_connection().execute(
-                "SELECT status FROM pending_reviews WHERE id = ?", (review_id,)
+                "SELECT status, reviewer_notes FROM pending_reviews WHERE id = ?", (review_id,)
             ).fetchone()
-            assert dict(row)["status"] == "open"
+            assert dict(row)["status"] == "resolved"
+            assert dict(row)["reviewer_notes"] == "auto_close:moved_to_cleanup"
 
     def test_closes_anomaly_review_when_type_absent(self, sample_config, sample_commission):
         """Anomaly review whose type is absent from current_anomalies → closed."""
@@ -847,8 +848,8 @@ class TestEvaluateStaleReviews:
             assert dict(row)["status"] == "resolved"
             assert dict(row)["reviewer_notes"] == "auto_close:anomaly_resolved"
 
-    def test_keeps_anomaly_review_open_when_type_still_present(self, sample_config, sample_commission):
-        """Anomaly review whose type is still in current_anomalies → stays open."""
+    def test_closes_anomaly_review_when_type_still_present(self, sample_config, sample_commission):
+        """Current anomaly reviews are now moved out of REVISIONES into cleanup."""
         pipeline = self._make_pipeline_with_context(sample_config)
         with pipeline.context:
             run_id = pipeline.context.start_run()
@@ -867,9 +868,10 @@ class TestEvaluateStaleReviews:
             )
 
             row = pipeline.context._require_connection().execute(
-                "SELECT status FROM pending_reviews WHERE id = ?", (review_id,)
+                "SELECT status, reviewer_notes FROM pending_reviews WHERE id = ?", (review_id,)
             ).fetchone()
-            assert dict(row)["status"] == "open"
+            assert dict(row)["status"] == "resolved"
+            assert dict(row)["reviewer_notes"] == "auto_close:moved_to_cleanup"
 
     def test_ignores_ambiguous_and_pago_no_controlado_reviews(self, sample_config, sample_commission):
         """Ambiguous and pago_no_controlado reviews must remain untouched."""
@@ -1079,7 +1081,7 @@ class TestFixPipelineAllocationBlockers:
     def test_non_blocking_guard_reasons_warn_but_continue(
         self, sample_config, sample_commission, sample_student, sample_movement, monkeypatch,
     ):
-        """Non-blocking guard reasons (e.g. missing_inscription) must save review but continue processing."""
+        """Non-blocking guard reasons move to cleanup but do not block processing."""
         pipeline = self._prepare_pipeline(sample_config, monkeypatch)
         monkeypatch.setattr(
             pipeline, "_detect_invalid_sheet_sequence",
@@ -1119,10 +1121,12 @@ class TestFixPipelineAllocationBlockers:
         with pipeline.context:
             pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
 
-        # Review must be saved with blocking=false
+        # Non-blocking guards no longer create pending reviews
         guard_reviews = [r for r in saved_reviews if r.get("reason") == "guard:invalid_sequence"]
-        assert len(guard_reviews) == 1, "guard review must be saved"
-        assert guard_reviews[0]["context_json"]["blocking"] is False
+        assert guard_reviews == []
+        assert pipeline._cleanup_tasks
+        cleanup_types = {task["task_type"] for task in pipeline._cleanup_tasks.values()}
+        assert "Inscripción" in cleanup_types
 
         # Allocate must still be called
         assert captured.get("allocate_called") is True, "allocate must run after non-blocking guard"

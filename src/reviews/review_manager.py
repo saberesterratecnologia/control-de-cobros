@@ -1,4 +1,4 @@
-"""Human review export/sync manager for REVISIONES worksheet."""
+"""Human queue export/sync manager for REVISIONES and LIMPIEZA_HOJA."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ LOGGER = logging.getLogger(__name__)
 
 class ReviewManager:
     HEADER = ["case_id", "comision", "dni", "problema", "detalle", "resolucion"]
+    CLEANUP_HEADER = ["case_id", "comision", "dni", "tipo", "resumen", "estado", "nota"]
+    _CLEANUP_DONE_STATES = {"HECHO", "OK", "LISTO"}
+    _CLEANUP_IGNORE_STATES = {"IGNORAR", "OMITIR"}
 
     # Priority order for guard:invalid_sequence reasons (higher index = more severe).
     _GUARD_REASON_SEVERITY: dict[str, int] = {
@@ -89,11 +92,41 @@ class ReviewManager:
         self._ensure_header(worksheet)
         return worksheet
 
+    def _get_cleanup_sheet(self) -> Any | None:
+        if self.sheets._client is None:  # noqa: SLF001
+            LOGGER.warning("sheets client unavailable, skipping LIMPIEZA_HOJA sync/export")
+            return None
+
+        sheet_cfg = self.config.get("sheets", {})
+        spreadsheet_id = sheet_cfg.get("spreadsheet_id")
+        spreadsheet_name = sheet_cfg.get("spreadsheet_name", "")
+
+        if spreadsheet_id:
+            spreadsheet = self.sheets._client.open_by_key(spreadsheet_id)  # noqa: SLF001
+        else:
+            spreadsheet = self.sheets._client.open(spreadsheet_name)  # noqa: SLF001
+
+        try:
+            worksheet = spreadsheet.worksheet("LIMPIEZA_HOJA")
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="LIMPIEZA_HOJA", rows=200, cols=7)
+
+        self._ensure_cleanup_header(worksheet)
+        return worksheet
+
     def _ensure_header(self, worksheet: Any) -> None:
         row1 = worksheet.row_values(1)
         if row1[:6] != self.HEADER:
             worksheet.batch_update(
                 [{"range": "A1:F1", "values": [self.HEADER]}],
+                value_input_option="RAW",
+            )
+
+    def _ensure_cleanup_header(self, worksheet: Any) -> None:
+        row1 = worksheet.row_values(1)
+        if row1[:7] != self.CLEANUP_HEADER:
+            worksheet.batch_update(
+                [{"range": "A1:G1", "values": [self.CLEANUP_HEADER]}],
                 value_input_option="RAW",
             )
 
@@ -154,6 +187,90 @@ class ReviewManager:
             "pricing_cuota": pricing_cuota,
             "monto_ratio": monto_ratio,
         }
+
+    @staticmethod
+    def _cleanup_task_key(commission: str, dni: str, task_type: str) -> str:
+        return f"{commission.strip()}|{dni.strip()}|{task_type.strip()}"
+
+    def _cleanup_task(
+        self,
+        commission: str,
+        dni: str,
+        task_type: str,
+        summary: str,
+        context_json: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "task_key": self._cleanup_task_key(commission, dni, task_type),
+            "commission": commission,
+            "dni": dni,
+            "task_type": task_type,
+            "summary": summary,
+            "context_json": context_json,
+        }
+
+    def _build_guard_cleanup_tasks(self, context_json: dict[str, Any]) -> list[dict[str, Any]]:
+        commission = str(context_json.get("commission") or "").strip()
+        dni = str(context_json.get("dni") or "").strip()
+        if not commission or not dni:
+            return []
+
+        tasks: dict[str, dict[str, Any]] = {}
+        for reason in context_json.get("reasons") or []:
+            if reason == "missing_inscription_with_existing_cuotas":
+                task = self._cleanup_task(commission, dni, "Inscripción", "Agregar inscripción", context_json)
+            elif reason in {"cuota_1_matches_inscription_amount", "cuota_1_combines_inscription_and_cuota"}:
+                task = self._cleanup_task(commission, dni, "Inscripción", "Separar inscripción y cuota 1", context_json)
+            elif reason == "inscription_with_non_standard_amount":
+                task = self._cleanup_task(commission, dni, "Importes", "Validar monto de inscripción", context_json)
+            elif reason.startswith("duplicate_cuota_") or reason.startswith("missing_cuotas_before_") or reason.startswith("cuota_exceeds_total"):
+                task = self._cleanup_task(commission, dni, "Secuencia", "Ordenar cuotas", context_json)
+            else:
+                task = self._cleanup_task(commission, dni, "Hoja", "Revisar carga histórica", context_json)
+            tasks[task["task_key"]] = task
+        return list(tasks.values())
+
+    def _build_anomaly_cleanup_task(self, reason: str, context_json: dict[str, Any]) -> dict[str, Any] | None:
+        commission = str(context_json.get("commission") or "").strip()
+        dni = str(context_json.get("dni") or "").strip()
+        if not commission or not dni:
+            return None
+
+        anomaly = reason.split(":", 1)[1] if ":" in reason else reason
+        if anomaly in {"cobro_no_aplica", "missing_medio"}:
+            return self._cleanup_task(commission, dni, "Cobro", "Corregir medio de cobro", context_json)
+        if anomaly == "venta_with_movement":
+            return self._cleanup_task(commission, dni, "Venta", "Quitar movimiento en venta", context_json)
+        if anomaly == "negative_monto":
+            return self._cleanup_task(commission, dni, "Monto", "Corregir monto negativo", context_json)
+        return self._cleanup_task(commission, dni, "Hoja", "Revisar fila cargada", context_json)
+
+    def build_cleanup_tasks(self, reason: str, context_json: dict[str, Any]) -> list[dict[str, Any]]:
+        if reason == "guard:invalid_sequence":
+            if bool(context_json.get("blocking")):
+                return []
+            return self._build_guard_cleanup_tasks(context_json)
+
+        if reason.startswith("anomaly:"):
+            task = self._build_anomaly_cleanup_task(reason, context_json)
+            return [task] if task is not None else []
+
+        return []
+
+    def upsert_cleanup_tasks(self, run_id: str, tasks: list[dict[str, Any]]) -> int:
+        count = 0
+        for task in tasks:
+            self.context.save_cleanup_task(
+                run_id=run_id,
+                task_key=task["task_key"],
+                commission=task["commission"],
+                dni=task["dni"],
+                task_type=task["task_type"],
+                summary=task["summary"],
+                context_json=task.get("context_json") or {},
+            )
+            count += 1
+        return count
 
     def build_problem_summary(self, reason: str, context_json: dict[str, Any]) -> tuple[str, str]:
         """Return (problema_category, detalle) for the REVISIONES sheet.
@@ -495,6 +612,8 @@ class ReviewManager:
                 LOGGER.warning(
                     "skipping review %s: missing both comision and dni", case_id
                 )
+                if self.context is not None:
+                    self.context.close_review(review["id"], "auto_close:missing_commission_and_dni")
                 skipped += 1
                 continue
 
@@ -523,6 +642,103 @@ class ReviewManager:
             worksheet.append_rows(rows_to_append, value_input_option="RAW")
 
         return {"exported": len(rows_to_append), "skipped": skipped}
+
+    def export_cleanup_to_sheet(self, run_id: str | None = None) -> dict[str, int]:
+        worksheet = self._get_cleanup_sheet()
+        if worksheet is None:
+            return {"exported": 0, "skipped": 0}
+        open_tasks = self.context.get_all_open_cleanup_tasks(run_id=run_id)
+
+        existing_case_ids = set()
+        all_values = worksheet.get_all_values()
+        for row in all_values[1:]:
+            if row and row[0].strip():
+                existing_case_ids.add(row[0].strip())
+
+        rows_to_append: list[list[str]] = []
+        skipped = 0
+        for task in open_tasks:
+            case_id = f"CLN-{task['id']}"
+            if case_id in existing_case_ids:
+                skipped += 1
+                continue
+            rows_to_append.append(
+                [
+                    case_id,
+                    task["commission"],
+                    task["dni"],
+                    task["task_type"],
+                    task["summary"],
+                    "PENDIENTE",
+                    "",
+                ]
+            )
+
+        rows_to_append.sort(key=lambda row: (row[1], row[2], row[3]))
+        if rows_to_append:
+            worksheet.append_rows(rows_to_append, value_input_option="RAW")
+
+        return {"exported": len(rows_to_append), "skipped": skipped}
+
+    def sync_cleanup_statuses(self) -> dict[str, Any]:
+        worksheet = self._get_cleanup_sheet()
+        if worksheet is None:
+            return {"synced": 0, "removed_stale": 0, "errors": []}
+        rows = worksheet.get_all_values()
+
+        synced = 0
+        removed_stale = 0
+        errors: list[str] = []
+        rows_to_delete: list[int] = []
+
+        for idx, row in enumerate(rows[1:], start=2):
+            if len(row) < 6:
+                continue
+
+            case_id = (row[0] or "").strip()
+            state = (row[5] or "").strip().upper()
+            note = (row[6] or "").strip() if len(row) > 6 else ""
+
+            if not case_id or not state or state == "PENDIENTE":
+                continue
+
+            try:
+                match = re.match(r"^CLN-(\d+)$", case_id)
+                if match is None:
+                    raise ValueError(f"case_id inválido: {case_id}")
+                cleanup_task_id = int(match.group(1))
+
+                task = self.context.get_cleanup_task_by_id(cleanup_task_id)
+                if task is None or task.get("status") != "open":
+                    rows_to_delete.append(idx)
+                    removed_stale += 1
+                    continue
+
+                if state in self._CLEANUP_DONE_STATES:
+                    self.context.update_cleanup_task_status(
+                        cleanup_task_id,
+                        reviewer_notes=note or "HECHO",
+                        status="resolved",
+                    )
+                elif state in self._CLEANUP_IGNORE_STATES:
+                    self.context.update_cleanup_task_status(
+                        cleanup_task_id,
+                        reviewer_notes=note or "IGNORAR",
+                        status="ignored",
+                    )
+                else:
+                    continue
+
+                rows_to_delete.append(idx)
+                synced += 1
+            except Exception as error:  # noqa: BLE001
+                LOGGER.exception("failed to sync cleanup status", extra={"row": idx, "case_id": case_id})
+                errors.append(f"row {idx} ({case_id}): {error}")
+
+        for row_num in sorted(rows_to_delete, reverse=True):
+            worksheet.delete_rows(row_num)
+
+        return {"synced": synced, "removed_stale": removed_stale, "errors": errors}
 
     def sync_resolutions(self) -> dict[str, Any]:
         worksheet = self._get_revisiones_sheet()

@@ -535,6 +535,43 @@ def _make_sync_rm(sheet_rows: list[list[str]]) -> tuple[ReviewManager, MagicMock
     return rm, worksheet, ctx_mgr
 
 
+def _make_cleanup_rm(open_tasks: list[dict]) -> tuple[ReviewManager, MagicMock, MagicMock]:
+    worksheet = MagicMock()
+    worksheet.row_values.return_value = ReviewManager.CLEANUP_HEADER
+    worksheet.get_all_values.return_value = [ReviewManager.CLEANUP_HEADER]
+
+    sheets = MagicMock()
+    sheets._client = MagicMock()
+    spreadsheet = MagicMock()
+    sheets._client.open_by_key.return_value = spreadsheet
+    spreadsheet.worksheet.side_effect = lambda name: worksheet if name == "LIMPIEZA_HOJA" else worksheet
+
+    ctx_mgr = MagicMock()
+    ctx_mgr.get_all_open_cleanup_tasks.return_value = open_tasks
+
+    config = {"sheets": {"spreadsheet_id": "fake-id"}}
+    rm = ReviewManager(sheets_connector=sheets, context_manager=ctx_mgr, config=config)
+    return rm, worksheet, ctx_mgr
+
+
+def _make_cleanup_sync_rm(sheet_rows: list[list[str]]) -> tuple[ReviewManager, MagicMock, MagicMock]:
+    worksheet = MagicMock()
+    worksheet.row_values.return_value = ReviewManager.CLEANUP_HEADER
+    worksheet.get_all_values.return_value = [ReviewManager.CLEANUP_HEADER, *sheet_rows]
+
+    sheets = MagicMock()
+    sheets._client = MagicMock()
+    spreadsheet = MagicMock()
+    sheets._client.open_by_key.return_value = spreadsheet
+    spreadsheet.worksheet.side_effect = lambda name: worksheet if name == "LIMPIEZA_HOJA" else worksheet
+
+    ctx_mgr = MagicMock()
+
+    config = {"sheets": {"spreadsheet_id": "fake-id"}}
+    rm = ReviewManager(sheets_connector=sheets, context_manager=ctx_mgr, config=config)
+    return rm, worksheet, ctx_mgr
+
+
 class TestExportDedupByPaymentId:
     """Verify export_to_sheet deduplicates ambiguous reviews by payment_id."""
 
@@ -637,6 +674,77 @@ class TestExportDedupByPaymentId:
         result = rm.export_to_sheet()
 
         assert result["exported"] == 2
+
+
+class TestCleanupTasks:
+    def test_build_cleanup_tasks_from_non_blocking_guard(self) -> None:
+        tasks = RM.build_cleanup_tasks(
+            "guard:invalid_sequence",
+            {
+                "commission": "Com A",
+                "dni": "30111222",
+                "blocking": False,
+                "reasons": [
+                    "missing_inscription_with_existing_cuotas",
+                    "missing_cuotas_before_5:3,4",
+                ],
+            },
+        )
+
+        assert len(tasks) == 2
+        assert {task["task_type"] for task in tasks} == {"Inscripción", "Secuencia"}
+
+    def test_build_cleanup_tasks_ignores_blocking_guard(self) -> None:
+        tasks = RM.build_cleanup_tasks(
+            "guard:invalid_sequence",
+            {
+                "commission": "Com B",
+                "dni": "22334455",
+                "blocking": True,
+                "reasons": ["cuota_exceeds_total:12>9"],
+            },
+        )
+        assert tasks == []
+
+    def test_build_cleanup_task_from_anomaly(self) -> None:
+        tasks = RM.build_cleanup_tasks(
+            "anomaly:cobro_no_aplica",
+            {
+                "commission": "Com C",
+                "dni": "33445566",
+            },
+        )
+        assert len(tasks) == 1
+        assert tasks[0]["task_type"] == "Cobro"
+        assert tasks[0]["summary"] == "Corregir medio de cobro"
+
+    def test_export_cleanup_to_sheet(self) -> None:
+        tasks = [
+            {
+                "id": 10,
+                "commission": "Com D",
+                "dni": "44556677",
+                "task_type": "Secuencia",
+                "summary": "Ordenar cuotas",
+            }
+        ]
+        rm, ws, _ctx = _make_cleanup_rm(tasks)
+
+        result = rm.export_cleanup_to_sheet()
+
+        assert result == {"exported": 1, "skipped": 0}
+        appended = ws.append_rows.call_args[0][0]
+        assert appended == [["CLN-10", "Com D", "44556677", "Secuencia", "Ordenar cuotas", "PENDIENTE", ""]]
+
+    def test_sync_cleanup_status_marks_done_and_deletes_row(self) -> None:
+        rm, ws, ctx = _make_cleanup_sync_rm([["CLN-10", "Com D", "44556677", "Secuencia", "Ordenar cuotas", "HECHO", "listo"]])
+        ctx.get_cleanup_task_by_id.return_value = {"id": 10, "status": "open"}
+
+        result = rm.sync_cleanup_statuses()
+
+        assert result["synced"] == 1
+        ctx.update_cleanup_task_status.assert_called_once_with(10, reviewer_notes="listo", status="resolved")
+        ws.delete_rows.assert_called_once_with(2)
 
 
 class TestSyncResolutionLifecycle:

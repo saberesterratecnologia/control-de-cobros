@@ -391,6 +391,99 @@ class ContextManager:
         ).fetchone()
         return row is not None
 
+    def save_cleanup_task(
+        self,
+        run_id: str | None,
+        task_key: str,
+        commission: str,
+        dni: str,
+        task_type: str,
+        summary: str,
+        context_json: dict[str, Any] | None = None,
+        status: str = "open",
+    ) -> int:
+        conn = self._require_connection()
+        now = self._now()
+        conn.execute(
+            """
+            INSERT INTO cleanup_tasks (
+                run_id, task_key, commission, dni, task_type, summary,
+                context_json, status, reviewed_at, reviewer_notes,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            ON CONFLICT(task_key) DO UPDATE SET
+                run_id = excluded.run_id,
+                commission = excluded.commission,
+                dni = excluded.dni,
+                task_type = excluded.task_type,
+                summary = excluded.summary,
+                context_json = excluded.context_json,
+                status = excluded.status,
+                reviewed_at = NULL,
+                reviewer_notes = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                run_id,
+                task_key,
+                commission,
+                dni,
+                task_type,
+                summary,
+                json.dumps(context_json or {}),
+                status,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id FROM cleanup_tasks WHERE task_key = ? LIMIT 1",
+            (task_key,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def get_all_open_cleanup_tasks(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        conn = self._require_connection()
+        if run_id is None:
+            rows = conn.execute(
+                "SELECT * FROM cleanup_tasks WHERE status = 'open' ORDER BY commission, dni, task_type, id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM cleanup_tasks WHERE status = 'open' AND run_id = ? ORDER BY commission, dni, task_type, id",
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_cleanup_task_by_id(self, cleanup_task_id: int) -> dict[str, Any] | None:
+        conn = self._require_connection()
+        row = conn.execute(
+            "SELECT * FROM cleanup_tasks WHERE id = ? LIMIT 1",
+            (cleanup_task_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_cleanup_task_status(
+        self,
+        cleanup_task_id: int,
+        reviewer_notes: str,
+        status: str,
+    ) -> None:
+        conn = self._require_connection()
+        conn.execute(
+            """
+            UPDATE cleanup_tasks
+            SET status = ?, reviewer_notes = ?, reviewed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, reviewer_notes, self._now(), self._now(), cleanup_task_id),
+        )
+        conn.commit()
+
+    def close_cleanup_task(self, cleanup_task_id: int, reason: str, status: str = "resolved") -> None:
+        self.update_cleanup_task_status(cleanup_task_id, reviewer_notes=reason, status=status)
+
     def find_similar_resolutions(
         self,
         monto_ratio: float,

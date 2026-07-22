@@ -304,3 +304,57 @@ def test_review_resolution_upserts_by_case_id_and_helpers() -> None:
         rows = conn.execute("SELECT * FROM review_resolutions WHERE case_id = 'REV-1'").fetchall()
         assert len(rows) == 1
         assert dict(rows[0])["resolution"] == "Segunda"
+
+
+def test_cleanup_task_upserts_by_task_key_and_reopens() -> None:
+    with ContextManager(":memory:", schema_path=_schema_path()) as mgr:
+        run_id = mgr.start_run()
+        first_id = mgr.save_cleanup_task(
+            run_id=run_id,
+            task_key="Com A|30111222|Secuencia",
+            commission="Com A",
+            dni="30111222",
+            task_type="Secuencia",
+            summary="Ordenar cuotas",
+            context_json={"reasons": ["duplicate_cuota_3"]},
+        )
+        mgr.close_cleanup_task(first_id, "HECHO", status="resolved")
+
+        second_id = mgr.save_cleanup_task(
+            run_id=run_id,
+            task_key="Com A|30111222|Secuencia",
+            commission="Com A",
+            dni="30111222",
+            task_type="Secuencia",
+            summary="Ordenar cuotas",
+            context_json={"reasons": ["missing_cuotas_before_5:4"]},
+        )
+
+        assert second_id == first_id
+        reopened = mgr.get_cleanup_task_by_id(first_id)
+        assert reopened is not None
+        assert reopened["status"] == "open"
+        assert reopened["reviewer_notes"] is None
+
+
+def test_cleanup_task_status_helpers() -> None:
+    with ContextManager(":memory:", schema_path=_schema_path()) as mgr:
+        run_id = mgr.start_run()
+        cleanup_id = mgr.save_cleanup_task(
+            run_id=run_id,
+            task_key="Com B|22334455|Cobro",
+            commission="Com B",
+            dni="22334455",
+            task_type="Cobro",
+            summary="Corregir medio de cobro",
+        )
+
+        open_tasks = mgr.get_all_open_cleanup_tasks()
+        assert len(open_tasks) == 1
+        assert open_tasks[0]["id"] == cleanup_id
+
+        mgr.update_cleanup_task_status(cleanup_id, reviewer_notes="IGNORAR", status="ignored")
+        closed = mgr.get_cleanup_task_by_id(cleanup_id)
+        assert closed is not None
+        assert closed["status"] == "ignored"
+        assert closed["reviewer_notes"] == "IGNORAR"

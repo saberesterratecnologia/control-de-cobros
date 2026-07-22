@@ -106,6 +106,23 @@ CREATE TABLE IF NOT EXISTS review_resolutions (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS cleanup_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    task_key TEXT NOT NULL UNIQUE,
+    commission TEXT NOT NULL,
+    dni TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    context_json TEXT,
+    status TEXT NOT NULL,
+    reviewed_at TEXT,
+    reviewer_notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id)
+);
+
 CREATE TABLE IF NOT EXISTS rollback_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
