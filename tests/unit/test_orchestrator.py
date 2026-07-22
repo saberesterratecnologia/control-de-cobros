@@ -189,7 +189,9 @@ def test_pipeline_classification_logic(sample_config, sample_commission, sample_
 
     assert auto.resolution == Resolution.AUTO_FIX
     assert llm.resolution == Resolution.SKIPPED
-    assert pending.resolution == Resolution.PENDING_REVIEW
+    # EXTRA_ROW is now skipped under insert-only policy (not deleted or flagged)
+    assert pending.resolution == Resolution.SKIPPED
+    assert pending.resolved_by == "insert_only_policy"
     assert len(resolved) == 1
 
 
@@ -657,7 +659,7 @@ class TestProcessStudentCutoffAndLedger:
         with pipeline.context:
             pipeline._process_student(sample_student, sample_commission, actual_rows, dry_run=True)
 
-        assert captured["reconcile_row_ids"] == []
+        assert captured["reconcile_row_ids"] == [None]
 
     def test_seeds_ledger_only_from_closed_payment_rows(
         self, sample_config, sample_commission, sample_student, sample_movement, sample_payment, monkeypatch,
@@ -745,8 +747,8 @@ class TestProcessStudentCutoffAndLedger:
         initial_ledger = captured["initial_ledger"]
         assert initial_ledger is not None
         assert initial_ledger.inscription_paid is True
-        assert initial_ledger.cuotas_paid == 0
-        assert initial_ledger.existing_concepts == {"Inscripción"}
+        assert initial_ledger.cuotas_paid == 1
+        assert initial_ledger.existing_concepts == {"Inscripción", "Cuota 1"}
 
 
 # ===================================================================
@@ -980,3 +982,336 @@ class TestProcessStudentStaleReviewHook:
             pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
 
         assert close_calls == []
+
+
+# ===================================================================
+# Fix Pipeline Allocation Blockers — regression tests
+# ===================================================================
+
+
+class TestFixPipelineAllocationBlockers:
+    """Regression tests for R1–R4 pipeline allocation fixes."""
+
+    def _prepare_pipeline(self, sample_config, monkeypatch):
+        pipeline = ConciliationPipeline(sample_config)
+        pipeline._run_id = "run-1"
+
+        monkeypatch.setattr(pipeline.context, "save_pending_review", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_checkpoint", lambda **_: 1)
+        monkeypatch.setattr(pipeline.context, "save_discrepancy", lambda *_: 1)
+        monkeypatch.setattr(pipeline.context, "is_already_applied", lambda *_: False)
+        monkeypatch.setattr(pipeline, "_evaluate_stale_reviews", lambda **_: None)
+        monkeypatch.setattr(pipeline, "_classify_and_resolve", lambda *args, **kwargs: [])
+        monkeypatch.setattr(pipeline, "_delete_excess_rows", lambda *args, **kwargs: None)
+        monkeypatch.setattr(pipeline, "_build_expected_rows_from_allocations", lambda *args, **kwargs: [])
+
+        return pipeline
+
+    # --- R1: Manual-only student reaches allocate/reconcile ---
+
+    def test_manual_only_student_reaches_allocate_reconcile(
+        self, sample_config, sample_commission, sample_student, sample_movement, sample_payment, monkeypatch,
+    ):
+        """Student with only manual Venta rows (id_pago_mp=None) must NOT be skipped."""
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+        monkeypatch.setattr(pipeline, "_detect_invalid_sheet_sequence", lambda *args, **kwargs: [])
+
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [],
+        )
+        monkeypatch.setattr(
+            pipeline.sql, "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_allocate(self, payments, existing_sheet_rows, student, seed_ledger_from_sheet=False, ledger_seed_rows=None):
+            captured["allocate_called"] = True
+            captured["seed_ledger_from_sheet"] = seed_ledger_from_sheet
+            captured["ledger_seed_rows"] = ledger_seed_rows
+            return AllocationResult(allocated=[], ambiguous=[], next_venta=None)
+
+        monkeypatch.setattr("src.rules.allocation_engine.AllocationEngine.allocate", _fake_allocate)
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.renumber_allocations",
+            lambda self, allocations, student, initial_ledger=None: (allocations, None),
+        )
+
+        reconcile_called = []
+
+        def _capture_reconcile(*, allocations, sheet_rows, next_venta, commission_name):
+            reconcile_called.append(True)
+            return []
+
+        monkeypatch.setattr(pipeline.reconciler, "reconcile", _capture_reconcile)
+
+        actual_rows = [
+            _make_venta_row(
+                "Inscripción",
+                Decimal("10000"),
+                row_number=1,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 1, 10),
+                id_pago_mp=None,
+            ),
+            _make_venta_row(
+                "Cuota 1",
+                Decimal("5000"),
+                row_number=2,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 2, 10),
+                id_pago_mp=None,
+            ),
+        ]
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, actual_rows, dry_run=True)
+
+        assert captured.get("allocate_called") is True, "allocate must be called for manual-only students"
+        assert len(reconcile_called) == 1, "reconcile must be called for manual-only students"
+
+    # --- R2: Non-blocking guard reasons warn but continue ---
+
+    def test_non_blocking_guard_reasons_warn_but_continue(
+        self, sample_config, sample_commission, sample_student, sample_movement, monkeypatch,
+    ):
+        """Non-blocking guard reasons (e.g. missing_inscription) must save review but continue processing."""
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+        monkeypatch.setattr(
+            pipeline, "_detect_invalid_sheet_sequence",
+            lambda *args, **kwargs: ["missing_inscription_with_existing_cuotas"],
+        )
+
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [],
+        )
+        monkeypatch.setattr(
+            pipeline.sql, "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+
+        saved_reviews: list[dict] = []
+
+        def _save_review(**kwargs):
+            saved_reviews.append(kwargs)
+            return 1
+
+        monkeypatch.setattr(pipeline.context, "save_pending_review", _save_review)
+
+        captured: dict[str, object] = {}
+
+        def _fake_allocate(self, payments, existing_sheet_rows, student, seed_ledger_from_sheet=False, ledger_seed_rows=None):
+            captured["allocate_called"] = True
+            return AllocationResult(allocated=[], ambiguous=[], next_venta=None)
+
+        monkeypatch.setattr("src.rules.allocation_engine.AllocationEngine.allocate", _fake_allocate)
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.renumber_allocations",
+            lambda self, allocations, student, initial_ledger=None: (allocations, None),
+        )
+        monkeypatch.setattr(pipeline.reconciler, "reconcile", lambda **_: [])
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
+
+        # Review must be saved with blocking=false
+        guard_reviews = [r for r in saved_reviews if r.get("reason") == "guard:invalid_sequence"]
+        assert len(guard_reviews) == 1, "guard review must be saved"
+        assert guard_reviews[0]["context_json"]["blocking"] is False
+
+        # Allocate must still be called
+        assert captured.get("allocate_called") is True, "allocate must run after non-blocking guard"
+
+    # --- R2: Blocking guard reason (cuota_exceeds_total) still blocks ---
+
+    def test_cuota_exceeds_total_still_blocks(
+        self, sample_config, sample_commission, sample_student, monkeypatch,
+    ):
+        """cuota_exceeds_total guard must still block processing with return [], []."""
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+        monkeypatch.setattr(
+            pipeline, "_detect_invalid_sheet_sequence",
+            lambda *args, **kwargs: ["cuota_exceeds_total:15>12"],
+        )
+
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [],
+        )
+
+        saved_reviews: list[dict] = []
+
+        def _save_review(**kwargs):
+            saved_reviews.append(kwargs)
+            return 1
+
+        monkeypatch.setattr(pipeline.context, "save_pending_review", _save_review)
+
+        allocate_called = []
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.allocate",
+            lambda self, **_: allocate_called.append(True) or AllocationResult(allocated=[], ambiguous=[], next_venta=None),
+        )
+
+        with pipeline.context:
+            result = pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
+
+        assert result == ([], []), "cuota_exceeds_total must return empty"
+
+        # Review must be saved with blocking=true
+        guard_reviews = [r for r in saved_reviews if r.get("reason") == "guard:invalid_sequence"]
+        assert len(guard_reviews) == 1, "guard review must be saved"
+        assert guard_reviews[0]["context_json"]["blocking"] is True
+
+        assert len(allocate_called) == 0, "allocate must NOT be called when cuota_exceeds_total blocks"
+
+    # --- R3: Manual Venta rows seed the ledger ---
+
+    def test_manual_venta_rows_seed_ledger(
+        self, sample_config, sample_commission, sample_student, sample_movement, sample_payment, monkeypatch,
+    ):
+        """Manual Venta rows (id_pago_mp=None) must be included in ledger_seed_rows."""
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+        monkeypatch.setattr(pipeline, "_detect_invalid_sheet_sequence", lambda *args, **kwargs: [])
+
+        closed_payment = sample_payment.model_copy(update={
+            "id_pago_mp": 101,
+            "fecha": datetime(2026, 1, 10, 10, 0, 0),
+            "id_concepto_pago": 1,
+            "monto": Decimal("10000"),
+        })
+
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [(closed_payment, sample_movement)],
+        )
+        monkeypatch.setattr(
+            pipeline.sql, "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_allocate(self, payments, existing_sheet_rows, student, seed_ledger_from_sheet=False, ledger_seed_rows=None):
+            captured["ledger_seed_rows"] = ledger_seed_rows
+            captured["seed_ledger_from_sheet"] = seed_ledger_from_sheet
+            return AllocationResult(allocated=[], ambiguous=[], next_venta=None)
+
+        monkeypatch.setattr("src.rules.allocation_engine.AllocationEngine.allocate", _fake_allocate)
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.renumber_allocations",
+            lambda self, allocations, student, initial_ledger=None: (allocations, None),
+        )
+        monkeypatch.setattr(pipeline.reconciler, "reconcile", lambda **_: [])
+
+        actual_rows = [
+            _make_venta_row(
+                "Inscripción",
+                Decimal("10000"),
+                row_number=1,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 1, 10),
+                id_pago_mp=101,
+            ),
+            _make_cobro_row(
+                "Inscripción",
+                Decimal("10000"),
+                row_number=2,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 1, 10),
+                id_pago_mp=101,
+            ),
+            _make_venta_row(
+                "Cuota 1",
+                Decimal("5000"),
+                row_number=3,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 3, 10),
+                id_pago_mp=None,
+            ),
+        ]
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, actual_rows, dry_run=True)
+
+        seed_rows = captured.get("ledger_seed_rows") or []
+        seed_conceptos = [r.concepto for r in seed_rows]
+        assert "Cuota 1" in seed_conceptos, "Manual Cuota 1 Venta row must seed the ledger"
+        assert "Inscripción" in seed_conceptos, "Protected Inscripción Venta row must seed the ledger"
+
+    # --- R4: Manual rows visible to reconciler when protections exist ---
+
+    def test_manual_rows_visible_to_reconciler_with_protections(
+        self, sample_config, sample_commission, sample_student, sample_movement, sample_payment, monkeypatch,
+    ):
+        """Manual rows (id_pago_mp=None) must remain visible to the reconciler when protections exist."""
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+        monkeypatch.setattr(pipeline, "_detect_invalid_sheet_sequence", lambda *args, **kwargs: [])
+
+        protected_payment = sample_payment.model_copy(update={
+            "id_pago_mp": 101,
+            "fecha": datetime(2026, 1, 10, 10, 0, 0),
+            "id_concepto_pago": 1,
+            "monto": Decimal("10000"),
+        })
+
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [(protected_payment, sample_movement)],
+        )
+        monkeypatch.setattr(
+            pipeline.sql, "get_active_commissions_for_student",
+            lambda _id, year, id_organizacion=2: [sample_commission],
+        )
+
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.allocate",
+            lambda self, payments, existing_sheet_rows, student, seed_ledger_from_sheet=False, ledger_seed_rows=None: AllocationResult(allocated=[], ambiguous=[], next_venta=None),
+        )
+        monkeypatch.setattr(
+            "src.rules.allocation_engine.AllocationEngine.renumber_allocations",
+            lambda self, allocations, student, initial_ledger=None: (allocations, None),
+        )
+
+        captured: dict[str, object] = {}
+
+        def _capture_reconcile(*, allocations, sheet_rows, next_venta, commission_name):
+            captured["reconcile_row_ids"] = [row.id_pago_mp for row in sheet_rows]
+            return []
+
+        monkeypatch.setattr(pipeline.reconciler, "reconcile", _capture_reconcile)
+
+        actual_rows = [
+            _make_venta_row(
+                "Inscripción",
+                Decimal("10000"),
+                row_number=1,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 1, 10),
+                id_pago_mp=101,
+            ),
+            _make_venta_row(
+                "Cuota 1",
+                Decimal("5000"),
+                row_number=2,
+                comision=sample_commission.nombre,
+                dni=sample_student.dni,
+                fecha_movimiento=date(2026, 3, 10),
+                id_pago_mp=None,
+            ),
+        ]
+
+        with pipeline.context:
+            pipeline._process_student(sample_student, sample_commission, actual_rows, dry_run=True)
+
+        assert None in captured["reconcile_row_ids"], "Manual row (id_pago_mp=None) must be visible to reconciler"
+        assert 101 not in captured["reconcile_row_ids"], "Protected row must be excluded from reconciler"

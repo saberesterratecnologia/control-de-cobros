@@ -720,3 +720,43 @@ def test_renumber_with_initial_ledger_multiple_new_cuotas() -> None:
     assert [a.concept for a in renumbered] == ["Cuota 3", "Cuota 4", "Cuota 5"]
     assert next_venta is not None
     assert next_venta.concepto == "Cuota 6"
+
+
+def test_renumber_with_no_allocations_returns_no_next_venta() -> None:
+    """When there are no allocations at all, next_venta must be None.
+
+    Students with zero resolved payments should not get a phantom
+    'next thing to pay' row inserted into the sheet.
+    """
+    engine = AllocationEngine(_commission(total=8))
+
+    renumbered, next_venta = engine.renumber_allocations(
+        [], _student(), initial_ledger=None,
+    )
+
+    assert renumbered == []
+    assert next_venta is None
+
+
+def test_renumber_with_no_allocations_but_initial_ledger_returns_no_next_venta() -> None:
+    """Even with a pre-populated ledger, zero new allocations means no next_venta.
+
+    This covers the case where all of a student's payments were already
+    protected (reflected in the sheet) and the pipeline passed an empty
+    allocation list to renumber.  The system should not generate a phantom
+    Cuota row for a payment that doesn't exist.
+    """
+    engine = AllocationEngine(_commission(total=8))
+
+    pre_ledger = Ledger(
+        inscription_paid=True,
+        cuotas_paid=3,
+        existing_concepts={"Inscripción", "Cuota 1", "Cuota 2", "Cuota 3"},
+    )
+
+    renumbered, next_venta = engine.renumber_allocations(
+        [], _student(), initial_ledger=pre_ledger,
+    )
+
+    assert renumbered == []
+    assert next_venta is None

@@ -1037,7 +1037,13 @@ class AllocationEngine:
             renumbered.append(alloc)
             self._update_ledger(ledger, alloc)
 
-        # Recompute next_venta with the correct ledger and reference date
+        # Recompute next_venta with the correct ledger and reference date.
+        # Only generate next_venta when there are actual allocations —
+        # students with zero resolved payments should not get a phantom
+        # "next thing to pay" row inserted into the sheet.
+        if not sorted_allocs:
+            return renumbered, None
+
         latest_date: _date_type | None = None
         for alloc in reversed(sorted_allocs):
             if alloc.payment.payment.fecha is not None:

@@ -37,6 +37,9 @@ from src.writer.patch_builder import PatchBuilder
 from src.writer.sheet_writer import SheetWriter
 
 
+BLOCKING_GUARD_PREFIXES: frozenset[str] = frozenset({"cuota_exceeds_total"})
+
+
 @dataclass
 class _RunCounters:
     cobros_blocked: int = 0
@@ -228,8 +231,9 @@ class ConciliationPipeline:
             student_discrepancies, _ = self._process_student(student, commission, sheet_rows, dry_run=dry_run, force_reprocess=force_reprocess)
             discrepancies.extend(student_discrepancies)
 
-        # Clean up sheet rows for students no longer in this commission
-        self._clean_orphaned_rows(commission, students, sheet_rows)
+        # NOTE: _clean_orphaned_rows is intentionally skipped under the
+        # insert-only policy.  Rows for students who left the commission
+        # are left as-is; cleanup is a supervised manual operation.
 
         assert self._run_id is not None
         self.context.save_checkpoint(
@@ -302,15 +306,21 @@ class ConciliationPipeline:
 
         # --- Guard: invalid existing sequence in sheet ---
         # If the student's current Venta rows already show an impossible /
-        # suspicious sequence, do NOT continue allocating on top of that broken
-        # state. Escalate to human review instead of compounding the damage.
+        # suspicious sequence, evaluate severity.  Only reasons whose prefix
+        # is in BLOCKING_GUARD_PREFIXES halt allocation; the rest save a
+        # review for human awareness and continue processing.
         if not force_reprocess:
             invalid_reasons = self._detect_invalid_sheet_sequence(commission, actual_rows)
             if invalid_reasons:
+                has_blocking = any(
+                    any(reason.startswith(prefix) for prefix in BLOCKING_GUARD_PREFIXES)
+                    for reason in invalid_reasons
+                )
                 LOGGER.warning(
-                    "%s DNI=%s: invalid sheet sequence detected, skipping allocation (%s)",
+                    "%s DNI=%s: invalid sheet sequence detected%s (%s)",
                     commission.nombre.strip(),
                     student.dni.strip(),
+                    ", blocking allocation" if has_blocking else ", continuing (non-blocking)",
                     "; ".join(invalid_reasons),
                 )
                 self._counters.pending_review += 1
@@ -322,12 +332,14 @@ class ConciliationPipeline:
                         "commission": commission.nombre.strip(),
                         "dni": student.dni.strip(),
                         "reasons": invalid_reasons,
+                        "blocking": has_blocking,
                         "pricing_inscripcion": str(commission.valor_inscripcion_promocion or commission.valor_inscripcion or ""),
                         "pricing_cuota": str(commission.valor_cuota_bonificada or commission.valor_cuota or ""),
                         "cantidad_cuotas": commission.cantidad_cuotas,
                     },
                 )
-                return [], []
+                if has_blocking:
+                    return [], []
 
         # --- Evaluate stale reviews (after guard detection, before allocation) ---
         # Determine current guard state: when force_reprocess is True, guard
@@ -412,7 +424,7 @@ class ConciliationPipeline:
                 ledger_seed_rows = [
                     row
                     for row in actual_rows
-                    if row.id_pago_mp is not None and row.id_pago_mp in protected_pago_ids
+                    if row.tipo_movimiento.strip().casefold() == "venta"
                 ]
                 if skipped_protected:
                     LOGGER.info(
@@ -423,38 +435,14 @@ class ConciliationPipeline:
                     )
 
         # Protected payment ids seed the ledger and stay out of reconciliation.
-        # Rows without id_pago_mp also stay out when protections exist because
-        # they may be legacy/manual representations of those same payments.
-        use_sheet_ledger = not force_reprocess and bool(protected_pago_ids)
+        # Manual rows (id_pago_mp=None) pass through naturally since
+        # None is never in protected_pago_ids (a set[int]).
+        use_sheet_ledger = not force_reprocess and bool(ledger_seed_rows)
         if protected_pago_ids:
             actual_rows_for_reconciler = [
                 row for row in actual_rows
-                if row.id_pago_mp is not None
-                and row.id_pago_mp > 0
-                and row.id_pago_mp not in protected_pago_ids
+                if row.id_pago_mp not in protected_pago_ids
             ]
-        elif not force_reprocess and actual_rows:
-            # No protected payment ids were found, but the
-            # student already has rows in the sheet.  Check if any rows
-            # have a REAL id_pago_mp (matching an actual payment).
-            has_any_real_pago_id = any(
-                r.id_pago_mp is not None
-                and r.id_pago_mp > 0
-                and r.id_pago_mp in real_payment_ids
-                for r in actual_rows
-            )
-            if not has_any_real_pago_id:
-                # All rows are manual/legacy — skip this student entirely.
-                # Do not allocate, reconcile, or insert anything.  The
-                # sheet is considered correct as-is.
-                LOGGER.info(
-                    "%s DNI=%s: all sheet rows are manual (no id_pago_mp), skipping student",
-                    commission.nombre.strip(),
-                    student.dni.strip(),
-                )
-                return [], []
-            else:
-                actual_rows_for_reconciler = actual_rows
         else:
             actual_rows_for_reconciler = actual_rows
 
@@ -489,22 +477,23 @@ class ConciliationPipeline:
             else:
                 unresolved_ambiguous.append(ambiguous)
 
-        # --- Pass 2: rebuild cuota ordinals and next_venta ---
+        # --- Pass 2: rebuild cuota ordinals ---
         # After all ambiguous payments are resolved, renumber cuotas
-        # chronologically and recompute next_venta with the correct
-        # ledger state and a business-derived reference date.
+        # chronologically with the correct ledger state.
         # When settled payment IDs were skipped, seed the renumbering ledger
         # from those settled rows so cuota ordinals continue from the
         # pre-existing state instead of restarting at 1.
+        # next_venta is intentionally discarded — the pipeline only inserts
+        # rows backed by real payments, never placeholder "next to pay" rows.
         sheet_ledger = Ledger.from_sheet_rows(ledger_seed_rows) if use_sheet_ledger else None
-        resolved_allocations, next_venta = allocator.renumber_allocations(
+        resolved_allocations, _next_venta = allocator.renumber_allocations(
             resolved_allocations, student, initial_ledger=sheet_ledger,
         )
 
         discrepancies = self.reconciler.reconcile(
             allocations=resolved_allocations,
             sheet_rows=actual_rows_for_reconciler,
-            next_venta=next_venta,
+            next_venta=None,
             commission_name=commission.nombre,
         )
         llm_resolutions = self._classify_and_resolve(
@@ -517,14 +506,10 @@ class ConciliationPipeline:
             current_guard_reasons=current_guard_reasons,
         )
 
-        # Deduplicate: if the sheet has more rows than expected for this student,
-        # delete the excess. This cleans up residual duplicates from prior runs.
-        expected_rows = self._build_expected_rows_from_allocations(
-            resolved_allocations, commission, student,
-        )
-        if next_venta is not None:
-            expected_rows.append(next_venta)
-        self._delete_excess_rows(expected_rows, actual_rows_for_reconciler, discrepancies)
+        # NOTE: _delete_excess_rows is intentionally skipped.  The pipeline
+        # operates in insert-only mode — existing sheet rows (including
+        # legacy/MAKE entries) are never deleted or modified.  Duplicate
+        # cleanup is a separate manual/supervised process.
 
         # NOTE: unresolved ambiguous reviews are already persisted inside
         # _resolve_ambiguous() with full LLM decision context.  Do NOT
@@ -1039,20 +1024,15 @@ class ConciliationPipeline:
                 )
                 continue
 
-            # Extra rows that don't match any expected row should be deleted.
-            # These are leftover rows from MAKE plan entries, prior buggy runs,
-            # or transferred students whose orphan cleanup missed them.
-            if discrepancy.discrepancy_type == DiscrepancyType.EXTRA_ROW and discrepancy.actual_row is not None:
-                discrepancy.confidence = 1.0
-                discrepancy.severity = Severity.WARNING
-                discrepancy.resolution = Resolution.AUTO_FIX
-                discrepancy.resolved_by = "extra_row_cleanup"
+            # Extra rows (legacy/MAKE entries not matched to any expected row)
+            # are intentionally left untouched.  The pipeline operates in
+            # insert-only mode and never deletes existing sheet data.
+            if discrepancy.discrepancy_type == DiscrepancyType.EXTRA_ROW:
+                discrepancy.confidence = 0.0
+                discrepancy.severity = Severity.INFO
+                discrepancy.resolution = Resolution.SKIPPED
+                discrepancy.resolved_by = "insert_only_policy"
                 self._counters.discrepancies_total += 1
-                self._counters.auto_fix += 1
-                self.patch_builder.add_delete(
-                    row=discrepancy.actual_row,
-                    discrepancy_id=discrepancy.id,
-                )
                 self.context.save_discrepancy(self._run_id, discrepancy)
                 continue
 
