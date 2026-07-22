@@ -77,14 +77,16 @@ class Commission(BaseModel):
     id_organizacion: int
     nombre: str
     valor_inscripcion: Decimal | None = None
-    valor_inscripcion_promocion: Decimal | None
+    valor_inscripcion_promocion: Decimal | None = None
     valor_cuota: Decimal | None = None
-    valor_cuota_bonificada: Decimal | None
+    valor_cuota_bonificada: Decimal | None = None
+    valor_cuota_recargo: Decimal | None = None
     valor_pago_unico: Decimal | None = None
-    cantidad_cuotas: int | None
+    valor_certificacion: Decimal | None = None
+    cantidad_cuotas: int | None = None
     duracion_meses: int | None = None
-    fecha_inicio: date | None
-    borrado: bool
+    fecha_inicio: date | None = None
+    borrado: bool = False
     analisis_pagos: bool = True
 
 

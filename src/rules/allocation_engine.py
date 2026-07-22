@@ -119,12 +119,25 @@ class AllocationEngine:
             raw_pago_unico if raw_pago_unico and raw_pago_unico > 0 else None
         )
 
+        # Cuota with late surcharge (recargo/mora)
+        raw_recargo = commission.valor_cuota_recargo
+        self.cuota_recargo_price: Decimal | None = (
+            raw_recargo if raw_recargo and raw_recargo > 0 else None
+        )
+
+        # Certification price (separate concept from cuotas/inscription)
+        raw_cert = commission.valor_certificacion
+        self.certificacion_price: Decimal | None = (
+            raw_cert if raw_cert and raw_cert > 0 else None
+        )
+
         # All known single-concept prices for matching
         self._inscription_prices: list[Decimal] = [
             p for p in [self.inscription_price, self.inscription_price_full] if p is not None and p > 0
         ]
         self._cuota_prices: list[Decimal] = [
-            p for p in [self.cuota_price, self.cuota_price_full] if p is not None and p > 0
+            p for p in [self.cuota_price, self.cuota_price_full, self.cuota_recargo_price]
+            if p is not None and p > 0
         ]
 
     @property
@@ -370,6 +383,10 @@ class AllocationEngine:
         # --- exact pago_unico match (before cuota matching) ---
         if self.pago_unico_price is not None and monto == self.pago_unico_price:
             return [self._make_alloc(cp, "Pago Único", monto, has_cobro)]
+
+        # --- exact certificación match ---
+        if self.certificacion_price is not None and monto == self.certificacion_price:
+            return [self._make_alloc(cp, "Certificación", monto, has_cobro)]
 
         # --- exact / near cuota (bonified or full price) ---
         if not db_says_inscription and inscription_context:
@@ -650,6 +667,11 @@ class AllocationEngine:
                     concepts = [(f"Cuota {next_cuota_n}", cuota_amount)]
                     break
 
+        # Try certificación match
+        if not concepts and self.certificacion_price is not None:
+            if monto == self.certificacion_price:
+                concepts = [("Certificación", self.certificacion_price)]
+
         if not concepts:
             return None
 
@@ -892,6 +914,22 @@ class AllocationEngine:
                         reasoning=(
                             f"Monto {monto} is {ratio:.1%} of valor_pago_unico "
                             f"{self.pago_unico_price}"
+                        ),
+                    )
+                )
+
+        # Certificación from explicit valor_certificacion
+        if self.certificacion_price is not None and self.certificacion_price > 0:
+            ratio = float(monto / self.certificacion_price)
+            if 0.90 <= ratio <= 1.10:
+                candidates.append(
+                    AllocationCandidate(
+                        concept="Certificación",
+                        amount=self.certificacion_price,
+                        score=max(0.0, 1.0 - abs(1.0 - ratio) * 5),
+                        reasoning=(
+                            f"Monto {monto} is {ratio:.1%} of valor_certificacion "
+                            f"{self.certificacion_price}"
                         ),
                     )
                 )

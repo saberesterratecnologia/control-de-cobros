@@ -137,9 +137,26 @@ class SQLServerConnector:
             data["importe"] = Decimal(data["importe"])
         return BankMovement.model_validate(data)
 
-    def get_commissions(self, id_curso: int) -> list[Commission]:
-        query = """
-            SELECT
+    _COMMISSION_COLUMNS = [
+        "id_comision",
+        "id_curso",
+        "id_organizacion",
+        "nombre",
+        "valor_inscripcion",
+        "valor_inscripcion_promocion",
+        "valor_cuota",
+        "valor_cuota_bonificada",
+        "valor_cuota_recargo",
+        "valor_pago_unico",
+        "valor_certificacion",
+        "cantidad_cuotas",
+        "duracion_meses",
+        "fecha_inicio",
+        "borrado",
+        "analisis_pagos",
+    ]
+
+    _COMMISSION_SELECT = """
                 c.id_comision,
                 c.id_curso,
                 c.id_organizacion,
@@ -148,12 +165,22 @@ class SQLServerConnector:
                 c.valor_inscripcion_promocion,
                 c.valor_cuota,
                 c.valor_cuota_bonificada,
+                c.valor_cuota_recargo,
                 c.valor_pago_unico,
+                c.valor_certificacion,
                 c.cantidad_cuotas,
                 c.duracion_meses,
                 c.fecha_inicio,
                 c.borrado,
-                c.analisis_pagos
+                c.analisis_pagos"""
+
+    def _commission_from_row(self, row: Any) -> Commission:
+        data = self._row_to_dict(row, self._COMMISSION_COLUMNS)
+        return Commission.model_validate(data)
+
+    def get_commissions(self, id_curso: int) -> list[Commission]:
+        query = f"""
+            SELECT{self._COMMISSION_SELECT}
             FROM COMISIONES c
             WHERE c.id_curso = ? AND c.borrado = 0
               AND c.analisis_pagos = 1
@@ -161,42 +188,12 @@ class SQLServerConnector:
         """
         cursor = self._cursor()
         rows = cursor.execute(query, (id_curso,)).fetchall()
-        columns = [
-            "id_comision",
-            "id_curso",
-            "id_organizacion",
-            "nombre",
-            "valor_inscripcion",
-            "valor_inscripcion_promocion",
-            "valor_cuota",
-            "valor_cuota_bonificada",
-            "valor_pago_unico",
-            "cantidad_cuotas",
-            "duracion_meses",
-            "fecha_inicio",
-            "borrado",
-            "analisis_pagos",
-        ]
-        return [Commission.model_validate(self._row_to_dict(row, columns)) for row in rows]
+        return [self._commission_from_row(row) for row in rows]
 
     def get_active_commissions(self, year: int, id_organizacion: int = 2) -> list[Commission]:
         """Get active commissions filtered by organization and year."""
-        query = """
-            SELECT
-                c.id_comision,
-                c.id_curso,
-                c.id_organizacion,
-                c.nombre,
-                c.valor_inscripcion,
-                c.valor_inscripcion_promocion,
-                c.valor_cuota,
-                c.valor_cuota_bonificada,
-                c.valor_pago_unico,
-                c.cantidad_cuotas,
-                c.duracion_meses,
-                c.fecha_inicio,
-                c.borrado,
-                c.analisis_pagos
+        query = f"""
+            SELECT{self._COMMISSION_SELECT}
             FROM COMISIONES c
             WHERE c.id_organizacion = ?
               AND YEAR(c.fecha_inicio) = ?
@@ -206,23 +203,7 @@ class SQLServerConnector:
         """
         cursor = self._cursor()
         rows = cursor.execute(query, (id_organizacion, year)).fetchall()
-        columns = [
-            "id_comision",
-            "id_curso",
-            "id_organizacion",
-            "nombre",
-            "valor_inscripcion",
-            "valor_inscripcion_promocion",
-            "valor_cuota",
-            "valor_cuota_bonificada",
-            "valor_pago_unico",
-            "cantidad_cuotas",
-            "duracion_meses",
-            "fecha_inicio",
-            "borrado",
-            "analisis_pagos",
-        ]
-        return [Commission.model_validate(self._row_to_dict(row, columns)) for row in rows]
+        return [self._commission_from_row(row) for row in rows]
 
     def get_students(self, id_comision: int) -> list[Student]:
         query = """
@@ -273,22 +254,8 @@ class SQLServerConnector:
         year: int,
         id_organizacion: int = 2,
     ) -> list[Commission]:
-        query = """
-            SELECT
-                c.id_comision,
-                c.id_curso,
-                c.id_organizacion,
-                c.nombre,
-                c.valor_inscripcion,
-                c.valor_inscripcion_promocion,
-                c.valor_cuota,
-                c.valor_cuota_bonificada,
-                c.valor_pago_unico,
-                c.cantidad_cuotas,
-                c.duracion_meses,
-                c.fecha_inicio,
-                c.borrado,
-                c.analisis_pagos
+        query = f"""
+            SELECT{self._COMMISSION_SELECT}
             FROM COMISIONES_PERSONAS cp
             INNER JOIN COMISIONES c ON c.id_comision = cp.id_comision
             WHERE cp.id_persona = ?
@@ -301,23 +268,7 @@ class SQLServerConnector:
         """
         cursor = self._cursor()
         rows = cursor.execute(query, (id_persona, id_organizacion, year)).fetchall()
-        columns = [
-            "id_comision",
-            "id_curso",
-            "id_organizacion",
-            "nombre",
-            "valor_inscripcion",
-            "valor_inscripcion_promocion",
-            "valor_cuota",
-            "valor_cuota_bonificada",
-            "valor_pago_unico",
-            "cantidad_cuotas",
-            "duracion_meses",
-            "fecha_inicio",
-            "borrado",
-            "analisis_pagos",
-        ]
-        return [Commission.model_validate(self._row_to_dict(row, columns)) for row in rows]
+        return [self._commission_from_row(row) for row in rows]
 
     def get_payments(
         self,

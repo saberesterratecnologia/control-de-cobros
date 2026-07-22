@@ -83,20 +83,22 @@ def test_sqlserver_connector_queries_are_parameterized(mock_connect: MagicMock) 
 
     fake_cursor.execute.return_value.fetchall.return_value = [
         (
-            10,
-            60,
-            1,
-            "Comisión A",
-            Decimal("20000"),
-            Decimal("10000"),
-            Decimal("24000"),
-            Decimal("12000"),
-            None,
-            5,
-            9,
-            datetime(2026, 1, 1).date(),
-            False,
-            True,
+            10,                           # id_comision
+            60,                           # id_curso
+            1,                            # id_organizacion
+            "Comisión A",                 # nombre
+            Decimal("20000"),             # valor_inscripcion
+            Decimal("10000"),             # valor_inscripcion_promocion
+            Decimal("24000"),             # valor_cuota
+            Decimal("12000"),             # valor_cuota_bonificada
+            None,                         # valor_cuota_recargo
+            None,                         # valor_pago_unico
+            None,                         # valor_certificacion
+            5,                            # cantidad_cuotas
+            9,                            # duracion_meses
+            datetime(2026, 1, 1).date(),  # fecha_inicio
+            False,                        # borrado
+            True,                         # analisis_pagos
         )
     ]
 

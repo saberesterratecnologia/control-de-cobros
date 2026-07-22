@@ -15,6 +15,8 @@ def _commission(
     cuota: str | None = "98640.00",
     total: int = 8,
     valor_pago_unico: str | None = None,
+    valor_cuota_recargo: str | None = None,
+    valor_certificacion: str | None = None,
 ) -> Commission:
     return Commission(
         id_comision=10,
@@ -25,7 +27,9 @@ def _commission(
         valor_inscripcion_promocion=Decimal(insc) if insc else None,
         valor_cuota=Decimal(cuota) if cuota else None,
         valor_cuota_bonificada=Decimal(cuota) if cuota else None,
+        valor_cuota_recargo=Decimal(valor_cuota_recargo) if valor_cuota_recargo else None,
         valor_pago_unico=Decimal(valor_pago_unico) if valor_pago_unico else None,
+        valor_certificacion=Decimal(valor_certificacion) if valor_certificacion else None,
         cantidad_cuotas=total,
         duracion_meses=9,
         fecha_inicio=date(2026, 1, 1),
@@ -760,3 +764,67 @@ def test_renumber_with_no_allocations_but_initial_ledger_returns_no_next_venta()
 
     assert renumbered == []
     assert next_venta is None
+
+
+# ------------------------------------------------------------------
+# valor_cuota_recargo — cuota with late surcharge
+# ------------------------------------------------------------------
+
+def test_exact_cuota_recargo_matches_as_cuota() -> None:
+    """A payment matching valor_cuota_recargo should allocate as the next cuota."""
+    comm = _commission(cuota="98640.00", valor_cuota_recargo="115000.00")
+    engine = AllocationEngine(comm)
+    cp = _cp(amount="115000.00")
+    ledger = Ledger(inscription_paid=True, cuotas_paid=2)
+    result = engine._try_allocate(cp, ledger, sheet_has_inscription=True)
+    assert result is not None
+    assert len(result) == 1
+    assert result[0].concept == "Cuota 3"
+    assert result[0].amount == Decimal("115000.00")
+
+
+def test_cuota_recargo_in_cuota_prices_list() -> None:
+    """valor_cuota_recargo should appear in _cuota_prices for candidate generation."""
+    comm = _commission(cuota="98640.00", valor_cuota_recargo="115000.00")
+    engine = AllocationEngine(comm)
+    assert Decimal("115000.00") in engine._cuota_prices
+
+
+# ------------------------------------------------------------------
+# valor_certificacion — certification payment
+# ------------------------------------------------------------------
+
+def test_exact_certificacion_matches_deterministically() -> None:
+    """A payment matching valor_certificacion should allocate as Certificación."""
+    comm = _commission(valor_certificacion="35000.00")
+    engine = AllocationEngine(comm)
+    cp = _cp(amount="35000.00")
+    ledger = Ledger(inscription_paid=True, cuotas_paid=3)
+    result = engine._try_allocate(cp, ledger, sheet_has_inscription=True)
+    assert result is not None
+    assert len(result) == 1
+    assert result[0].concept == "Certificación"
+    assert result[0].amount == Decimal("35000.00")
+
+
+def test_certificacion_generates_candidate_when_near_match() -> None:
+    """Near-certificación amount should generate a scored candidate."""
+    comm = _commission(valor_certificacion="35000.00")
+    engine = AllocationEngine(comm)
+    cp = _cp(amount="34800.00")
+    ledger = Ledger(inscription_paid=True, cuotas_paid=3)
+    candidates = engine._generate_candidates(cp, ledger)
+    cert_candidates = [c for c in candidates if c.concept == "Certificación"]
+    assert len(cert_candidates) >= 1
+    assert cert_candidates[0].amount == Decimal("35000.00")
+
+
+def test_certificacion_in_ignoring_ledger_fallback() -> None:
+    """_try_allocate_ignoring_ledger should match certificación."""
+    comm = _commission(valor_certificacion="35000.00")
+    engine = AllocationEngine(comm)
+    cp = _cp(amount="35000.00")
+    result = engine._try_allocate_ignoring_ledger(cp, [], ledger=Ledger())
+    assert result is not None
+    assert len(result) == 1
+    assert result[0].concept == "Certificación"
