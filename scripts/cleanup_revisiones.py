@@ -157,17 +157,26 @@ def main() -> None:
         print(f"Closed {closed} pending reviews in context.db")
         conn.close()
 
-    # Delete rows from sheet (bottom-up to preserve indices)
-    print(f"Deleting {total_remove} rows from REVISIONES sheet...")
-    batch_size = 50
-    sorted_rows = sorted(rows_to_delete, reverse=True)
-    for i in range(0, len(sorted_rows), batch_size):
-        batch = sorted_rows[i : i + batch_size]
-        for row_num in batch:
-            ws.delete_rows(row_num)
-        print(f"  Deleted batch {i // batch_size + 1} ({len(batch)} rows)")
+    # Rewrite the sheet: clear all data rows and write back only the kept ones.
+    # This is far more efficient than deleting 2000+ rows one by one.
+    rows_to_delete_set = set(rows_to_delete)
+    kept_rows = [
+        row for idx, row in enumerate(data, start=2)
+        if idx not in rows_to_delete_set
+    ]
 
-    print(f"\nDone. REVISIONES now has ~{total_keep} actionable rows.")
+    print(f"Rewriting REVISIONES: clearing {len(data)} rows, writing {len(kept_rows)} back...")
+
+    # Clear all data rows (keep header)
+    if len(data) > 0:
+        last_row = len(data) + 1  # +1 for header
+        ws.batch_clear([f"A2:F{last_row}"])
+
+    # Write kept rows back
+    if kept_rows:
+        ws.update(range_name=f"A2:F{len(kept_rows) + 1}", values=kept_rows)
+
+    print(f"\nDone. REVISIONES now has {len(kept_rows)} actionable rows.")
 
 
 if __name__ == "__main__":
