@@ -406,6 +406,46 @@ def test_db_says_cuota_but_inscription_plus_cuota_splits_correctly() -> None:
     assert [a.concept for a in result.allocated] == ["Inscripción", "Cuota 1"]
 
 
+def test_db_says_inscription_with_wider_tolerance() -> None:
+    """DB concept=1 (INSCRIPCION) with monto within 80%-120% of inscription price
+    should resolve as Inscripción without going to ambiguous."""
+    # $58,400 is ~107% of $54,800 inscription — within 80-120%
+    result = AllocationEngine(_commission()).allocate([_cp(amount="58400.00", concept_id=1)], [], _student())
+    assert len(result.allocated) == 1
+    assert result.allocated[0].concept == "Inscripción"
+    assert result.allocated[0].amount == Decimal("58400.00")
+    assert result.ambiguous == []
+
+
+def test_db_says_inscription_outside_tolerance_goes_ambiguous() -> None:
+    """DB concept=1 (INSCRIPCION) but monto >120% of inscription price
+    should not be auto-resolved."""
+    # $100,000 is ~183% of $54,800 — outside 80-120%
+    result = AllocationEngine(_commission()).allocate([_cp(amount="100000.00", concept_id=1)], [], _student())
+    assert len(result.allocated) == 0
+    assert len(result.ambiguous) >= 1
+
+
+def test_db_says_cuota_with_wider_40_160_tolerance() -> None:
+    """DB concept=2 (CUOTA) with monto within 40%-160% of cuota price
+    should resolve as Cuota."""
+    # $42,000 is ~43% of $98,640 cuota — within 40-160%
+    rows = [_sheet_row("Inscripción", "54800.00")]
+    result = AllocationEngine(_commission()).allocate([_cp(amount="42000.00", concept_id=2)], rows, _student())
+    assert len(result.allocated) == 1
+    assert result.allocated[0].concept == "Cuota 1"
+
+
+def test_db_says_cuota_outside_40_160_goes_ambiguous() -> None:
+    """DB concept=2 (CUOTA) but monto <40% of any cuota price
+    should not be auto-resolved."""
+    # $2,400 is ~2.4% of $98,640 — outside 40-160%
+    rows = [_sheet_row("Inscripción", "54800.00")]
+    result = AllocationEngine(_commission()).allocate([_cp(amount="2400.00", concept_id=2)], rows, _student())
+    assert len(result.allocated) == 0
+    assert len(result.ambiguous) >= 1
+
+
 def test_conciliated_payment_generates_cobro_even_if_venta_exists() -> None:
     """A conciliated payment whose Venta already exists still emits the full
     allocation so the reconciler can consume the existing Venta and check the Cobro.

@@ -291,25 +291,11 @@ class ConciliationPipeline:
             id_organizacion=commission.id_organizacion,
         )
 
-        # --- Flag uncontrolled payments from conciliated set ---
+        # --- Uncontrolled payments ---
+        # Previously flagged as pending reviews, but these payments are already
+        # conciliated with bank movements — the controlado flag is a backoffice
+        # concern, not a reconciliation blocker.  Process them normally.
         assert self._run_id is not None
-        for payment, _movement in conciliated_pairs:
-            if not payment.controlado:
-                self._counters.pending_review += 1
-                self.context.save_pending_review(
-                    run_id=self._run_id,
-                    discrepancy_id=None,
-                    reason="pago_no_controlado",
-                    context_json={
-                        "commission": commission.nombre.strip(),
-                        "dni": student.dni.strip(),
-                        "payment_id": payment.id_pago_mp,
-                        "monto": str(payment.monto),
-                        "fecha": payment.fecha.date().isoformat() if payment.fecha else None,
-                        "controlado": payment.controlado,
-                        "controlado_auto": payment.controlado_auto,
-                    },
-                )
 
         # Build ConciliatedPayment directly — no matching, no enrichment
         enriched_conciliated = [

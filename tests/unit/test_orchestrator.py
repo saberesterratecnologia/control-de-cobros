@@ -437,10 +437,10 @@ def test_generate_summary_has_no_phase0_keys(sample_config):
     assert "payments_pending" not in summary
 
 
-def test_uncontrolled_flagging_from_conciliated_pairs(
+def test_uncontrolled_payments_processed_without_review(
     sample_config, sample_commission, sample_student, sample_movement, monkeypatch,
 ):
-    """pago_no_controlado reviews must come from conciliated pairs, not get_all_payments."""
+    """Uncontrolled payments are processed normally without generating reviews."""
     pipeline = ConciliationPipeline(sample_config)
     pipeline._run_id = "run-1"
 
@@ -495,8 +495,7 @@ def test_uncontrolled_flagging_from_conciliated_pairs(
         pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
 
     pago_reviews = [r for r in saved_reviews if r.get("reason") == "pago_no_controlado"]
-    assert len(pago_reviews) == 1, "Uncontrolled payment from conciliated pair must generate review"
-    assert pago_reviews[0]["context_json"]["payment_id"] == 999
+    assert len(pago_reviews) == 0, "Uncontrolled payments should not generate reviews"
 
 
 class TestProcessStudentCutoffAndLedger:

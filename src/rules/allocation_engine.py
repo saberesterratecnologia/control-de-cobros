@@ -404,7 +404,7 @@ class AllocationEngine:
         # When the DB explicitly says CUOTA or RECARGO and the monto didn't
         # match any standard price within 1%, trust the DB concept and accept
         # the real amount if it's within a reasonable surcharge/discount range
-        # (50%-150% of any known cuota price).  This handles late payments
+        # (40%-160% of any known cuota price).  This handles late payments
         # with mora, partial discounts, and recargos that don't match exact prices.
         if db_says_cuota and inscription_context:
             next_n = ledger.cuotas_paid + 1
@@ -412,8 +412,22 @@ class AllocationEngine:
                 if candidate_cuota <= 0:
                     continue
                 ratio = monto / candidate_cuota
-                if Decimal("0.50") <= ratio <= Decimal("1.50"):
+                if Decimal("0.40") <= ratio <= Decimal("1.60"):
                     return [self._make_alloc(cp, f"Cuota {next_n}", monto, has_cobro)]
+
+        # --- DB-backed inscription with wider tolerance ---
+        # When the DB explicitly says INSCRIPCION and the monto didn't match
+        # any standard inscription price within 1%, trust the DB concept if
+        # the monto is within 80%-120% of any known inscription price.
+        # This handles old prices, rounding, and small adjustments.
+        if db_says_inscription and not ledger.inscription_paid:
+            for candidate_insc in self._inscription_prices:
+                if candidate_insc <= 0:
+                    continue
+                ratio = monto / candidate_insc
+                if Decimal("0.80") <= ratio <= Decimal("1.20"):
+                    concept = "Pago Único" if self.is_short_course_single_payment else "Inscripción"
+                    return [self._make_alloc(cp, concept, monto, has_cobro)]
 
         # --- Fallback: if DB said cuota but monto didn't match any cuota
         # price, OR DB said inscription but monto didn't match inscription
