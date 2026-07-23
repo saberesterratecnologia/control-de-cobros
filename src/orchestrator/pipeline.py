@@ -334,10 +334,14 @@ class ConciliationPipeline:
         if not force_reprocess:
             invalid_reasons = self._detect_invalid_sheet_sequence(commission, actual_rows)
             if invalid_reasons:
-                has_blocking = any(
-                    any(reason.startswith(prefix) for prefix in BLOCKING_GUARD_PREFIXES)
-                    for reason in invalid_reasons
-                )
+                blocking_reasons = [
+                    r for r in invalid_reasons
+                    if any(r.startswith(prefix) for prefix in BLOCKING_GUARD_PREFIXES)
+                ]
+                nonblocking_reasons = [
+                    r for r in invalid_reasons if r not in blocking_reasons
+                ]
+                has_blocking = bool(blocking_reasons)
                 LOGGER.warning(
                     "%s DNI=%s: invalid sheet sequence detected%s (%s)",
                     commission.nombre.strip(),
@@ -345,26 +349,35 @@ class ConciliationPipeline:
                     ", blocking allocation" if has_blocking else ", continuing (non-blocking)",
                     "; ".join(invalid_reasons),
                 )
-                guard_context = {
+                base_context = {
                     "commission": commission.nombre.strip(),
                     "dni": student.dni.strip(),
-                    "reasons": invalid_reasons,
-                    "blocking": has_blocking,
                     "pricing_inscripcion": str(commission.valor_inscripcion_promocion or commission.valor_inscripcion or ""),
                     "pricing_cuota": str(commission.valor_cuota_bonificada or commission.valor_cuota or ""),
                     "cantidad_cuotas": commission.cantidad_cuotas,
                 }
+                # Non-blocking reasons always go to LIMPIEZA_HOJA
+                if nonblocking_reasons:
+                    cleanup_context = {
+                        **base_context,
+                        "reasons": nonblocking_reasons,
+                        "blocking": False,
+                    }
+                    self._record_cleanup_tasks("guard:invalid_sequence", cleanup_context)
+                # Blocking reasons go to REVISIONES and halt allocation
                 if has_blocking:
+                    blocking_context = {
+                        **base_context,
+                        "reasons": blocking_reasons,
+                        "blocking": True,
+                    }
                     self._counters.pending_review += 1
                     self.context.save_pending_review(
                         run_id=self._run_id,
                         discrepancy_id=None,
                         reason="guard:invalid_sequence",
-                        context_json=guard_context,
+                        context_json=blocking_context,
                     )
-                else:
-                    self._record_cleanup_tasks("guard:invalid_sequence", guard_context)
-                if has_blocking:
                     return [], []
 
         # --- Evaluate stale reviews (after guard detection, before allocation) ---

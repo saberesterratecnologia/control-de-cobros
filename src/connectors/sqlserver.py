@@ -191,7 +191,11 @@ class SQLServerConnector:
         return [self._commission_from_row(row) for row in rows]
 
     def get_active_commissions(self, year: int, id_organizacion: int = 2) -> list[Commission]:
-        """Get active commissions filtered by organization and year."""
+        """Get active commissions filtered by organization and year.
+
+        Single-day events (seminars, workshops, etc.) are excluded because
+        they lack cuota pricing and generate unactionable reviews.
+        """
         query = f"""
             SELECT{self._COMMISSION_SELECT}
             FROM COMISIONES c
@@ -199,6 +203,8 @@ class SQLServerConnector:
               AND YEAR(c.fecha_inicio) = ?
               AND c.borrado = 0
               AND c.analisis_pagos = 1
+              AND c.fecha_finalizacion IS NOT NULL
+              AND DATEDIFF(day, c.fecha_inicio, c.fecha_finalizacion) > 1
             ORDER BY c.nombre
         """
         cursor = self._cursor()

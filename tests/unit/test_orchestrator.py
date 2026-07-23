@@ -1174,6 +1174,41 @@ class TestFixPipelineAllocationBlockers:
 
         assert len(allocate_called) == 0, "allocate must NOT be called when cuota_exceeds_total blocks"
 
+    def test_mixed_blocking_and_nonblocking_guard_reasons_split(self, sample_config, sample_commission, sample_student, monkeypatch):
+        """Mixed guard reasons: blocking goes to REVISIONES, non-blocking to LIMPIEZA_HOJA."""
+        pipeline = self._prepare_pipeline(sample_config, monkeypatch)
+        monkeypatch.setattr(
+            pipeline, "_detect_invalid_sheet_sequence",
+            lambda *args, **kwargs: ["duplicate_cuota_1", "cuota_exceeds_total:15>12"],
+        )
+        monkeypatch.setattr(
+            pipeline.sql, "get_conciliated_payments",
+            lambda _id, year=None, id_organizacion=None: [],
+        )
+
+        saved_reviews: list[dict] = []
+        def _save_review(**kwargs):
+            saved_reviews.append(kwargs)
+            return 1
+        monkeypatch.setattr(pipeline.context, "save_pending_review", _save_review)
+
+        with pipeline.context:
+            result = pipeline._process_student(sample_student, sample_commission, [], dry_run=True)
+
+        # Must block allocation
+        assert result == ([], []), "mixed reasons with blocking must halt"
+
+        # REVISIONES gets only blocking reason
+        guard_reviews = [r for r in saved_reviews if r.get("reason") == "guard:invalid_sequence"]
+        assert len(guard_reviews) == 1
+        assert guard_reviews[0]["context_json"]["reasons"] == ["cuota_exceeds_total:15>12"]
+        assert guard_reviews[0]["context_json"]["blocking"] is True
+
+        # LIMPIEZA_HOJA gets non-blocking reason
+        assert pipeline._cleanup_tasks
+        cleanup_types = {task["task_type"] for task in pipeline._cleanup_tasks.values()}
+        assert "Secuencia" in cleanup_types
+
     # --- R3: Manual Venta rows seed the ledger ---
 
     def test_manual_venta_rows_seed_ledger(
